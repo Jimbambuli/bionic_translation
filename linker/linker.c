@@ -1820,8 +1820,17 @@ static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 
 			memcpy(wrap_sym_name + 7, sym_name, MIN(sizeof(wrap_sym_name) - 7, strlen(sym_name)));
 			sym_addr = 0;
+			struct symbol_name own_name = { .name = sym_name };
 
-			if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+			/* The library's own definition comes first, as with the bionic linker, where the
+			 * library heads its local group and libc (which the bionic_ wrappers stand in for)
+			 * only follows as one of its DT_NEEDED libraries. It is also the cheap lookup: the
+			 * dlsym(RTLD_DEFAULT) for the wrapper walks every object in the process, which for a
+			 * library resolving tens of thousands of its own symbols took several 100 ms. */
+			if ((s = apkenv__elf_lookup(si, &own_name))) {
+				base = si->base;
+				apkenv_last_library_used = si->name;
+			} else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
 				LINKER_DEBUG_PRINTF("%s hooked symbol %s to %p\n", si->name, wrap_sym_name, (void *)sym_addr);
 			} else if ((s = apkenv__do_lookup(si, sym_name, &base))) {
 				// normal symbol
