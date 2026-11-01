@@ -139,13 +139,27 @@ struct bionic_pthread_cleanup_t {
 // For handling static initialization.
 #define INIT_IF_NOT_MAPPED(x, init) do { if (!IS_MAPPED(x)) init(x); } while(0)
 
+// The glibc objects all come from mmap(), so they are page aligned and lie above mmap_min_addr.
+// What else can be in the pointer slot is small: a bionic static initializer (0, or the type bits
+// << 14 for mutexes) or DESTROYED. This check runs on every lock, unlock, wait and signal, so it
+// must not cost a syscall: with mincore() here, the V8/ICU start-up of a real-world app made
+// 323 208 of them (~240 ms on a Ryzen 9 7900X) in one thread. AOSP bionic keeps the state inline
+// and takes a lock without entering the kernel (android-14 bionic/libc/bionic/pthread_mutex.cpp,
+// NormalMutexTryLock()).
+#define MAPPED_MIN_ADDR 0x10000
+#define MAPPED_ALIGN 0x1000
 static bool is_mapped(void *mem, const size_t sz)
 {
-	const size_t ps = sysconf(_SC_PAGESIZE);
-	assert(ps > 0);
-	unsigned char vec[(sz + ps - 1) / ps];
-	return !mincore(mem, sz, vec);
+	(void)sz;
+	const uintptr_t addr = (uintptr_t)mem;
+	return addr >= MAPPED_MIN_ADDR && !(addr & (MAPPED_ALIGN - 1));
 }
+
+// After munmap() the slot must no longer look mapped. 0xffff is what AOSP stores in a destroyed
+// mutex (pthread_mutex_destroy()); it matches no static initializer, so using a destroyed mutex
+// still fails the assertion in default_pthread_mutex_init() as it did with mincore().
+#define DESTROYED ((void *)0xffff)
+#define UNMAP(x) do { munmap(x->glibc, sizeof(*x->glibc)); x->glibc = DESTROYED; } while(0)
 
 void bionic___pthread_cleanup_push(struct bionic_pthread_cleanup_t *c, void (*routine)(void*), void *arg)
 {
@@ -198,7 +212,7 @@ int bionic_sem_destroy(bionic_sem_t *sem)
 	int ret = 0;
 	if (IS_MAPPED(sem)) {
 		ret = sem_destroy(sem->glibc);
-		munmap(sem->glibc, sizeof(*sem->glibc));
+		UNMAP(sem);
 	}
 	return ret;
 }
@@ -261,7 +275,7 @@ int bionic_pthread_rwlock_destroy(bionic_rwlock_t *rwlock)
 	int ret = 0;
 	if (IS_MAPPED(rwlock)) {
 		ret = pthread_rwlock_destroy(rwlock->glibc);
-		munmap(rwlock->glibc, sizeof(*rwlock->glibc));
+		UNMAP(rwlock);
 	}
 	return ret;
 
@@ -315,7 +329,7 @@ int bionic_pthread_attr_destroy(bionic_attr_t *attr)
 	int ret = 0;
 	if (IS_MAPPED(attr)) {
 		ret = pthread_attr_destroy(attr->glibc);
-		munmap(attr->glibc, sizeof(*attr->glibc));
+		UNMAP(attr);
 	}
 	return ret;
 }
@@ -435,7 +449,7 @@ int bionic_pthread_mutexattr_destroy(bionic_mutexattr_t *attr)
 	int ret = 0;
 	if (IS_MAPPED(attr)) {
 		ret = pthread_mutexattr_destroy(attr->glibc);
-		munmap(attr->glibc, sizeof(*attr->glibc));
+		UNMAP(attr);
 	}
 	return ret;
 }
@@ -479,7 +493,7 @@ int bionic_pthread_mutex_destroy(bionic_mutex_t *mutex)
 	int ret = 0;
 	if (IS_MAPPED(mutex)) {
 		ret = pthread_mutex_destroy(mutex->glibc);
-		munmap(mutex->glibc, sizeof(*mutex->glibc));
+		UNMAP(mutex);
 	}
 	return ret;
 }
@@ -528,7 +542,7 @@ int bionic_pthread_condattr_destroy(bionic_condattr_t *attr)
 	int ret = 0;
 	if (IS_MAPPED(attr)) {
 		ret = pthread_condattr_destroy(attr->glibc);
-		munmap(attr->glibc, sizeof(*attr->glibc));
+		UNMAP(attr);
 	}
 	return ret;
 }
@@ -565,7 +579,7 @@ int bionic_pthread_cond_destroy(bionic_cond_t *cond)
 	int ret = 0;
 	if (IS_MAPPED(cond)) {
 		ret = pthread_cond_destroy(cond->glibc);
-		munmap(cond->glibc, sizeof(*cond->glibc));
+		UNMAP(cond);
 	}
 	return ret;
 }
