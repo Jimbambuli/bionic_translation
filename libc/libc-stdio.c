@@ -1,4 +1,6 @@
+#include <stdarg.h>
 #include <stdio.h>
+#include <wchar.h>
 
 #include "libc-stdio.h"
 
@@ -41,6 +43,37 @@ int bionic_putc(int ch, FILE *f)
 }
 
 #ifdef __GLIBC__
+
+// Pre-M code (e.g. libvlc) passes &__sF[n] to the stdio functions. glibc reads the FILE structure itself before
+// any vtable call (fputc() checks the write buffer and calls __overflow(), which aborts with "invalid stdio
+// handle"), so every function that may get a standard stream maps it, as on musl (libc-musl.c).
+
+int bionic_fputc(int c, FILE *f) { return fputc(c, bionic_file_to_glibc_file(f)); }
+int bionic_fputc_unlocked(int c, FILE *f) { return fputc_unlocked(c, bionic_file_to_glibc_file(f)); }
+int bionic_putc_unlocked(int c, FILE *f) { return putc_unlocked(c, bionic_file_to_glibc_file(f)); }
+int bionic_fputs(const char *s, FILE *f) { return fputs(s, bionic_file_to_glibc_file(f)); }
+wint_t bionic_fputwc(wchar_t c, FILE *f) { return fputwc(c, bionic_file_to_glibc_file(f)); }
+int bionic_vfprintf(FILE *f, const char *fmt, va_list ap) { return vfprintf(bionic_file_to_glibc_file(f), fmt, ap); }
+int bionic_fprintf(FILE *f, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int ret = vfprintf(bionic_file_to_glibc_file(f), fmt, ap);
+	va_end(ap);
+	return ret;
+}
+int bionic_fgetc(FILE *f) { return fgetc(bionic_file_to_glibc_file(f)); }
+int bionic_getc(FILE *f) { return getc(bionic_file_to_glibc_file(f)); }
+int bionic_getc_unlocked(FILE *f) { return getc_unlocked(bionic_file_to_glibc_file(f)); }
+int bionic_ungetc(int c, FILE *f) { return ungetc(c, bionic_file_to_glibc_file(f)); }
+int bionic_fileno(FILE *f) { return fileno(bionic_file_to_glibc_file(f)); }
+int bionic_ferror(FILE *f) { return ferror(bionic_file_to_glibc_file(f)); }
+int bionic_feof(FILE *f) { return feof(bionic_file_to_glibc_file(f)); }
+void bionic_clearerr(FILE *f) { clearerr(bionic_file_to_glibc_file(f)); }
+void bionic_flockfile(FILE *f) { flockfile(bionic_file_to_glibc_file(f)); }
+void bionic_funlockfile(FILE *f) { funlockfile(bionic_file_to_glibc_file(f)); }
+int bionic_setvbuf(FILE *f, char *buf, int mode, size_t size) { return setvbuf(bionic_file_to_glibc_file(f), buf, mode, size); }
+void bionic_setbuf(FILE *f, char *buf) { setbuf(bionic_file_to_glibc_file(f), buf); }
 
 // Wrapping internal glibc VTABLE functions to handle bionic's pre-M crap
 // We define __real_IO_file_xsputn in libc.c so linker will link our library,
