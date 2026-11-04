@@ -181,6 +181,18 @@ void *bionic_dlsym(void *handle, const char *symbol)
 		sym = 0;
 	}
 
+	/* On Android, the libraries after the caller (RTLD_NEXT) include libc and the other system
+	 * libraries. Here those are the host libraries: look there last. Firefox's mozglue interposes
+	 * putenv() and finds the real one with dlsym(RTLD_NEXT). */
+	if (!sym && handle == RTLD_NEXT) {
+		void *host_sym = dlsym(RTLD_DEFAULT, symbol);
+		if (host_sym) {
+			pthread_mutex_unlock(&apkenv_dl_lock);
+			verbose("RTLD_NEXT: found system version");
+			return wrapper_create((char *)symbol, host_sym);
+		}
+	}
+
 	if (likely(sym != 0)) {
 		bind = ELF32_ST_BIND(sym->st_info);
 
