@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -429,6 +430,41 @@ int bionic_pthread_create(bionic_pthread_t *thread, const bionic_attr_t *attr, v
 {
 	assert(thread && (!attr || IS_MAPPED(attr)));
 	return pthread_create((pthread_t*)thread, (attr ? attr->glibc : NULL), start, arg);
+}
+
+/* bionic pthread_gettid_np(): the kernel thread id of a thread. glibc has it from 2.42 on; before, the
+ * id is read from glibc's struct pthread (pthread_t points to it), at the offset where the calling
+ * thread keeps its own id. */
+static pid_t (*glibc_gettid_np)(pthread_t);
+static ssize_t tid_offset = -1;
+
+static void find_tid(void)
+{
+	glibc_gettid_np = dlsym(RTLD_DEFAULT, "pthread_gettid_np");
+	if (glibc_gettid_np)
+		return;
+	const pid_t *self = (const pid_t *)pthread_self();
+	pid_t tid = gettid();
+	for (size_t i = 0; i < 1024 / sizeof(pid_t); i++) {
+		if (self[i] == tid) {
+			tid_offset = i * sizeof(pid_t);
+			break;
+		}
+	}
+}
+
+pid_t bionic_pthread_gettid_np(bionic_pthread_t thread)
+{
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, find_tid);
+
+	if (glibc_gettid_np)
+		return glibc_gettid_np((pthread_t)thread);
+	if ((pthread_t)thread == pthread_self())
+		return gettid();
+	if (tid_offset < 0)
+		return -1;
+	return *(const pid_t *)((const char *)thread + tid_offset);
 }
 
 /* ---------------------------------------------------------------------------------------------- *
