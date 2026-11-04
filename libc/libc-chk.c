@@ -160,6 +160,25 @@ size_t bionic___strlen_chk(const char *s, size_t s_len)
 	return ret;
 }
 
+/* bionic fortify.cpp __memchr_chk() and __memrchr_chk() with __check_buffer_access() */
+void *bionic___memchr_chk(const void *s, int c, size_t n, size_t actual_size)
+{
+	if (__builtin_expect(n > actual_size, 0)) {
+		fprintf(stderr, "memchr: prevented %zu-byte read from %zu-byte buffer\n", n, actual_size);
+		abort();
+	}
+	return memchr(s, c, n);
+}
+
+void *bionic___memrchr_chk(const void *s, int c, size_t n, size_t actual_size)
+{
+	if (__builtin_expect(n > actual_size, 0)) {
+		fprintf(stderr, "memrchr: prevented %zu-byte read from %zu-byte buffer\n", n, actual_size);
+		abort();
+	}
+	return memrchr(s, c, n);
+}
+
 char *bionic___strchr_chk(const char *p, int ch, size_t s_len)
 {
 	for (;; ++p, s_len--) {
