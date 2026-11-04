@@ -68,13 +68,27 @@ char *bionic_setlocale(int category, const char *locale)
 	}
 }
 
+/* Android apps run without HOME: the desktop's HOME is hidden from them. A HOME the app sets itself
+ * (Firefox's GeckoLoader puts its files folder there, Gecko finds its profile under it) is theirs. */
+static char *host_home;
+
+__attribute__((constructor)) static void keep_host_home(void)
+{
+	const char *home = getenv("HOME");
+	host_home = home ? strdup(home) : NULL;
+}
+
 char *bionic_getenv(const char *name) {
 	if(!name) {
 		printf("!!! NULL passed to %s\n", __func__);
 	}
 
-	if(!strcmp(name, "HOME"))
-		return NULL;
+	if(!strcmp(name, "HOME")) {
+		char *home = getenv("HOME");
+		if (!home || (host_home && !strcmp(home, host_home)))
+			return NULL;
+		return home;
+	}
 
 	/* no point returning anything else, apps mix this with using hardcoded paths */
 	if(!strcmp(name, "ANDROID_ROOT"))
