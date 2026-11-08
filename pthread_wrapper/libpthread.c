@@ -9,7 +9,6 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/mman.h>
-#include <setjmp.h>
 
 // when __GLIBC__ (or some glibc specific symbol) is not defined, we're assuming musl; can't check to be sure because 🤡
 
@@ -118,15 +117,9 @@ _Static_assert(sizeof(bionic_pthread_t) == sizeof(pthread_t), "bionic_pthread_t 
 typedef uint64_t bionic_rwlockattr_t;
 _Static_assert(sizeof(bionic_rwlockattr_t) == sizeof(pthread_rwlockattr_t), "bionic_rwlockattr_t and pthread_rwlockattr_t size mismatch");
 
+// bionic's __pthread_cleanup_t: the caller keeps it on its own stack
 struct bionic_pthread_cleanup_t {
-	union {
-		struct bionic_pthread_cleanup_t *prev;
-#ifdef __GLIBC__
-		__pthread_unwind_buf_t *glibc;
-#else
-		struct __ptcb *musl;
-#endif
-	};
+	struct bionic_pthread_cleanup_t *prev;
 	void (*routine)(void*);
 	void *arg;
 };
@@ -162,43 +155,39 @@ static bool is_mapped(void *mem, const size_t sz)
 #define DESTROYED ((void *)0xffff)
 #define UNMAP(x) do { munmap(x->glibc, sizeof(*x->glibc)); x->glibc = DESTROYED; } while(0)
 
+/* Like bionic (pthread_internal_t::cleanup_stack), the handlers are a per-thread list of the callers'
+ * structs; pthread_exit() runs what is left. They must not go through glibc's cancellation buffers
+ * (__pthread_register_cancel() with a sigsetjmp() in this function): pthread_exit() would
+ * longjmp back into the frame of __pthread_cleanup_push(), long gone by then, and call a
+ * `routine` read from an overwritten stack slot (seen as a jump to a heap address in libvlc's
+ * pthread_exit() when it ends a cancelled thread). bionic has no pthread_cancel(). */
+static __thread struct bionic_pthread_cleanup_t *cleanup_stack;
+
 void bionic___pthread_cleanup_push(struct bionic_pthread_cleanup_t *c, void (*routine)(void*), void *arg)
 {
 	assert(c && routine);
-#ifdef __GLIBC__
-	c->glibc = mmap(NULL, sizeof(*c->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	c->routine = routine;
 	c->arg = arg;
-
-	int not_first_call;
-	if ((not_first_call = sigsetjmp((struct __jmp_buf_tag*)(void*)c->glibc->__cancel_jmp_buf, 0))) {
-		routine(arg);
-		__pthread_unwind_next(c->glibc);
-	}
-
-	__pthread_register_cancel(c->glibc);
-#else
-	c->musl = mmap(NULL, sizeof(struct __ptcb), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-	c->routine = routine;
-	c->arg = arg;
-	_pthread_cleanup_push(c->musl, routine, arg);
-#endif
+	c->prev = cleanup_stack;
+	cleanup_stack = c;
 }
 
 void bionic___pthread_cleanup_pop(struct bionic_pthread_cleanup_t *c, int execute)
 {
-#ifdef __GLIBC__
-	assert(c && IS_MAPPED(c)); // TODO - analogically for musl?
-	__pthread_unregister_cancel(c->glibc);
-
+	assert(c);
+	cleanup_stack = c->prev;
 	if (execute)
 		c->routine(c->arg);
+}
 
-	munmap(c->glibc, sizeof(*c->glibc));
-#else
-	_pthread_cleanup_pop(c->musl, execute);
-	munmap(c->musl, sizeof(struct __ptcb));
-#endif
+void bionic_pthread_exit(void *retval)
+{
+	while (cleanup_stack) {
+		struct bionic_pthread_cleanup_t *c = cleanup_stack;
+		cleanup_stack = c->prev;
+		c->routine(c->arg);
+	}
+	pthread_exit(retval);
 }
 
 /* ---------------------------------------------------------------------------------------------- *
