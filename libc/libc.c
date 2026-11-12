@@ -211,7 +211,9 @@ glibc_dirent_to_bionic_dirent(const struct dirent *de, struct bionic_dirent *bde
 	    .d_type = de->d_type,
 	};
 	_Static_assert(sizeof(bde->d_name) >= sizeof(de->d_name), "bionic_dirent can't hold dirent's d_name");
-	memcpy(bde->d_name, de->d_name, sizeof(bde->d_name));
+	/* glibc's d_name ends with the record (d_reclen), not after 256 bytes: the last entry of the buffer
+	 * getdents() filled may end right before an unmapped page, so copy only up to the terminating NUL */
+	strncpy(bde->d_name, de->d_name, sizeof(bde->d_name) - 1);
 }
 
 struct bionic_dirent *
