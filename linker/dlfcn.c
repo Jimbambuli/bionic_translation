@@ -224,7 +224,9 @@ int bionic_dladdr(const void *addr, Dl_info *info)
 	if (si) {
 		memset(info, 0, sizeof(*info));
 
-		info->dli_fname = si->name;
+		/* the path the library was loaded from, as bionic (soinfo::get_realpath()), not only its name: Gecko looks
+		 * for libmozavcodec.so next to the library of a symbol it found this way */
+		info->dli_fname = si->fullpath[0] ? si->fullpath : si->name;
 		info->dli_fbase = (void *)(uintptr_t)si->base;
 
 		/* Determine if any symbol in the library contains the specified address */
