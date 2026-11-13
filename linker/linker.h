@@ -244,6 +244,9 @@ struct soinfo {
 	size_t tls_slot_id;
 
 	struct tls_index_list *tls_index_list;
+
+	/* DT_SONAME (an offset into strtab, 0: none): a later DT_NEEDED may name the library by it */
+	ElfW(Addr) soname_off;
 };
 
 extern soinfo apkenv_libdl_info;

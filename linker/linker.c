@@ -1549,7 +1549,10 @@ soinfo *apkenv_find_library(const char *name, const bool try_glibc, int glibc_fl
 	bname = bname ? bname + 1 : name;
 
 	for (si = apkenv_solist; si != 0; si = si->next) {
-		if (!strcmp(bname, si->name)) {
+		/* as bionic's linker: a loaded library also answers to its DT_SONAME (MJ PDF loads libmodpdfium.so,
+		 * whose soname libpdfium.so is what libjniPdfium.so needs) */
+		if (!strcmp(bname, si->name) || (si->soname_off && si->strtab && (si->flags & FLAG_LINKED) &&
+		                                  !strcmp(bname, si->strtab + si->soname_off))) {
 			if (si->flags & FLAG_ERROR) {
 				DL_ERR("%5d '%s' failed to load previously", apkenv_pid, bname);
 				return NULL;
@@ -2641,6 +2644,9 @@ static int apkenv_link_image(soinfo *si, /*unused...?*/ unsigned wr_offset)
 			break;
 		case DT_STRTAB:
 			si->strtab = (const char *)(si->base + d->d_un.d_ptr);
+			break;
+		case DT_SONAME:
+			si->soname_off = d->d_un.d_val;
 			break;
 		case DT_SYMTAB:
 			si->symtab = (ElfW(Sym) *)(si->base + d->d_un.d_ptr);
