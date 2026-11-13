@@ -77,6 +77,12 @@ ssize_t bionic___read_chk(int fd, void *buf, size_t count, size_t buf_size)
 	return read(fd, buf, count);
 }
 
+/* bionic fortify (LP64: off_t is 64 bits), unchecked like bionic___read_chk; glibc has its own __pread_chk */
+ssize_t bionic___pread_chk(int fd, void *buf, size_t count, off_t offset, size_t buf_size)
+{
+	return pread(fd, buf, count, offset);
+}
+
 int bionic___open_2(const char *pathname, int flags)
 {
 	flags |= O_LARGEFILE;
@@ -217,6 +223,17 @@ mode_t bionic___umask_chk(mode_t mode) {
 		fprintf(stderr, "umask called with invalid mask");
 	}
 	return umask(mode);
+}
+
+/* glibc has no __pwrite_chk: checked like bionic___write_chk (bionic: count must fit the buffer) */
+ssize_t bionic___pwrite_chk(int fd, const void *buf, size_t count, off_t offset, size_t buf_size)
+{
+	if (__builtin_expect(count > buf_size, 0)) {
+		fprintf(stderr, "pwrite: prevented read past end of buffer");
+		abort();
+	}
+
+	return pwrite(fd, buf, count, offset);
 }
 
 ssize_t bionic___write_chk(int fd, const void* buf, size_t count, size_t buf_size) {
