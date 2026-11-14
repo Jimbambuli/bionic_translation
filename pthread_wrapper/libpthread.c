@@ -180,6 +180,75 @@ void bionic___pthread_cleanup_pop(struct bionic_pthread_cleanup_t *c, int execut
 		c->routine(c->arg);
 }
 
+/* Go's cgo runtime for Android (runtime/cgo/gcc_android.c, inittls()) does not find
+ * android_get_device_api_level() here, so it creates a key, stores a magic value in it and looks
+ * for that value in the first 384 words of the thread control block. glibc keeps only keys
+ * 0-31 there (specific_1stblock); a higher key lives in a block of its own and Go aborts with
+ * "runtime/cgo: inittls: could not find pthread key" (Feeder, signal 6). Whether a low key is
+ * still free when the app's library loads depends on what the process did before. So the free
+ * keys below 32 are reserved before main() and handed to bionic callers first.
+ * glibc fixes a key's destructor at creation, so each reserved key gets a trampoline that calls
+ * the destructor its bionic caller asks for later. pthread_key_delete() needs no wrapper: a
+ * deleted key goes back to glibc and is not handed out from here again. */
+#define LOW_KEYS 32 // glibc's PTHREAD_KEY_2NDLEVEL_SIZE
+static pthread_key_t low_keys[LOW_KEYS];
+static void (*low_key_destructors[LOW_KEYS])(void *);
+static uint8_t low_keys_reserved;
+static uint8_t low_keys_given;
+static pthread_mutex_t low_keys_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define LOW_KEY_DTOR(i) \
+	static void low_key_dtor_##i(void *value) \
+	{ \
+		void (*destructor)(void *) = __atomic_load_n(&low_key_destructors[i], __ATOMIC_ACQUIRE); \
+		if (destructor) \
+			destructor(value); \
+	}
+#define LOW_KEY_DTOR8(a, b, c, d, e, f, g, h) \
+	LOW_KEY_DTOR(a) LOW_KEY_DTOR(b) LOW_KEY_DTOR(c) LOW_KEY_DTOR(d) \
+	LOW_KEY_DTOR(e) LOW_KEY_DTOR(f) LOW_KEY_DTOR(g) LOW_KEY_DTOR(h)
+LOW_KEY_DTOR8(0, 1, 2, 3, 4, 5, 6, 7)
+LOW_KEY_DTOR8(8, 9, 10, 11, 12, 13, 14, 15)
+LOW_KEY_DTOR8(16, 17, 18, 19, 20, 21, 22, 23)
+LOW_KEY_DTOR8(24, 25, 26, 27, 28, 29, 30, 31)
+#define LOW_KEY_REF8(a, b, c, d, e, f, g, h) \
+	low_key_dtor_##a, low_key_dtor_##b, low_key_dtor_##c, low_key_dtor_##d, \
+	low_key_dtor_##e, low_key_dtor_##f, low_key_dtor_##g, low_key_dtor_##h
+static void (*const low_key_trampolines[LOW_KEYS])(void *) = {
+	LOW_KEY_REF8(0, 1, 2, 3, 4, 5, 6, 7),
+	LOW_KEY_REF8(8, 9, 10, 11, 12, 13, 14, 15),
+	LOW_KEY_REF8(16, 17, 18, 19, 20, 21, 22, 23),
+	LOW_KEY_REF8(24, 25, 26, 27, 28, 29, 30, 31),
+};
+
+__attribute__((constructor)) static void reserve_low_keys(void)
+{
+	while (low_keys_reserved < LOW_KEYS) {
+		pthread_key_t key;
+		if (pthread_key_create(&key, low_key_trampolines[low_keys_reserved]) != 0)
+			break;
+		if (key >= LOW_KEYS) {
+			pthread_key_delete(key);
+			break;
+		}
+		low_keys[low_keys_reserved++] = key;
+	}
+}
+
+int bionic_pthread_key_create(bionic_key_t *key, void (*destructor)(void *))
+{
+	pthread_mutex_lock(&low_keys_lock);
+	if (low_keys_given < low_keys_reserved) {
+		const uint8_t i = low_keys_given++;
+		__atomic_store_n(&low_key_destructors[i], destructor, __ATOMIC_RELEASE);
+		*key = (bionic_key_t)low_keys[i];
+		pthread_mutex_unlock(&low_keys_lock);
+		return 0;
+	}
+	pthread_mutex_unlock(&low_keys_lock);
+	return pthread_key_create((pthread_key_t *)key, destructor);
+}
+
 void bionic_pthread_exit(void *retval)
 {
 	while (cleanup_stack) {
