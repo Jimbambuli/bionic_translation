@@ -1,6 +1,7 @@
 #include "../wrapper/verbose.h"
 #include <assert.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -274,6 +275,12 @@ int bionic_sigismember(const bionic_sigset_t *set, int sig)
 	return (int)((local_set[bit / LONG_BIT] >> (bit % LONG_BIT)) & 1);
 }
 
+/* Android: an app's sigaction() goes through ART's libsigchain, which keeps ART's handlers (implicit null checks,
+ * stack overflow checks of compiled code) in front of the app's for the signals ART claims. Called straight, glibc's
+ * sigaction() lets e.g. Gecko's crash reporter take SIGSEGV from ART, so every NullPointerException raised by an
+ * implicit null check becomes a crash. Without ART in the process (no sigchain_sigaction), glibc's sigaction(). */
+static int (*chained_sigaction)(int, const struct sigaction *, struct sigaction *);
+
 int bionic_sigaction(int sig, const struct bionic_sigaction *restrict act, struct bionic_sigaction *restrict oact)
 {
 	verbose("%d, %p, %p", sig, (void *)act, (void *)oact);
@@ -300,7 +307,12 @@ int bionic_sigaction(int sig, const struct bionic_sigaction *restrict act, struc
 		}
 	}
 
-	const int ret = sigaction(sig, (act ? &gact : NULL), (oact ? &goact : NULL));
+	if (!chained_sigaction) {
+		chained_sigaction = dlsym(RTLD_DEFAULT, "sigchain_sigaction");
+		if (!chained_sigaction)
+			chained_sigaction = sigaction;
+	}
+	const int ret = chained_sigaction(sig, (act ? &gact : NULL), (oact ? &goact : NULL));
 
 	if (oact) {
 		*oact = (struct bionic_sigaction){0};
