@@ -18,6 +18,7 @@
  * feel free to reimplement it using the copyable functions */
 
 typedef int __android_log_vprint_type(int prio, const char *tag, const char *fmt, va_list ap);
+typedef int __android_log_is_loggable_type(int prio, const char *tag, int default_prio);
 
 static int fallback_verbose_log(int prio, const char *tag, const char *fmt, va_list ap)
 {
@@ -37,13 +38,23 @@ static int android_log_vprintf(int prio, const char *tag, const char *fmt, va_li
 {
 
 	static __android_log_vprint_type *_android_log_vprintf = NULL;
+	static __android_log_is_loggable_type *_android_log_is_loggable = NULL;
 	if(!_android_log_vprintf) {
 		_android_log_vprintf = dlsym(RTLD_DEFAULT, "__android_log_vprint");
 
 		if(!_android_log_vprintf) {
 			_android_log_vprintf = &fallback_verbose_log;
+		} else {
+			_android_log_is_loggable = dlsym(RTLD_DEFAULT, "__android_log_is_loggable");
 		}
 	}
+
+	/* __android_log_vprint formats the message before liblog drops it for its priority, and the
+	 * linker logs several messages per relocation. Ask first, so dropped messages are not
+	 * formatted. Until liblog has read its settings it answers prio >= default_prio, so
+	 * ANDROID_LOG_VERBOSE passes everything on, as before. */
+	if (_android_log_is_loggable && !_android_log_is_loggable(prio, tag, ANDROID_LOG_VERBOSE))
+		return 0;
 
 	return _android_log_vprintf(prio, tag, fmt, ap);
 }
