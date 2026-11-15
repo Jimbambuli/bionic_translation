@@ -1889,6 +1889,12 @@ static void wrapper_names_update(void)
 	wrapper_names_subs = gen[1];
 }
 
+/* Only build the bionic_ name when it is looked up: most symbols resolve within the library. */
+static const char *bionic_name(char *buf, size_t size, const char *name)
+{
+	snprintf(buf, size, "bionic_%s", name);
+	return buf;
+}
 
 static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 {
@@ -1905,7 +1911,7 @@ static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 		ElfW(Addr) reloc = (ElfW(Addr))(rel->r_offset + si->base);
 		ElfW(Addr) sym_addr = 0;
 		const char *sym_name = NULL;
-		char wrap_sym_name[1024] = {'b', 'i', 'o', 'n', 'i', 'c', '_'};
+		char wrap_sym_name[1024];
 
 		DEBUG("Processing '%s' relocation at index %zd", si->name, idx);
 
@@ -1916,7 +1922,6 @@ static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 		if (sym != 0) {
 			sym_name = (const char *)(si->strtab + si->symtab[sym].st_name);
 
-			memcpy(wrap_sym_name + 7, sym_name, MIN(sizeof(wrap_sym_name) - 7, strlen(sym_name)));
 			sym_addr = 0;
 			struct symbol_name own_name = { .name = sym_name };
 
@@ -1931,7 +1936,7 @@ static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 			if (s && !tfind(sym_name, &wrapper_names, wrapper_names_cmp)) {
 				base = si->base;
 				apkenv_last_library_used = si->name;
-			} else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+			} else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, bionic_name(wrap_sym_name, sizeof(wrap_sym_name), sym_name)))) {
 				LINKER_DEBUG_PRINTF("%s hooked symbol %s to %p\n", si->name, wrap_sym_name, (void *)sym_addr);
 			} else if ((s = apkenv__do_lookup(si, sym_name, &base))) {
 				// normal symbol
