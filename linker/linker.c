@@ -45,6 +45,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <search.h>
 #include <fnmatch.h>
 
 #include <pthread.h>
@@ -1794,10 +1795,107 @@ static inline ElfW(Addr) get_addend(REL_TYPE *rel) {
 
 static bool die_because_of_missing_symbols = false;
 
+/* The names (without the "bionic_" prefix) for which a loaded host object exports a bionic_
+ * wrapper, read from the .dynsym of every object dl_iterate_phdr() reports and read again when
+ * objects were loaded or unloaded since. Checking a name here is a tree search, while
+ * dlsym(RTLD_DEFAULT) walks every object in the process. The set may contain names whose
+ * wrapper dlsym(RTLD_DEFAULT) does not find (RTLD_LOCAL objects), which only means we ask it. */
+static void *wrapper_names = NULL;
+static unsigned long long wrapper_names_adds = 0;
+static unsigned long long wrapper_names_subs = 0;
+
+static int wrapper_names_cmp(const void *a, const void *b)
+{
+	return strcmp(a, b);
+}
+
+static void wrapper_names_add(const char *strtab, const ElfW(Sym) *s)
+{
+	const char *name = strtab + s->st_name;
+	if (s->st_shndx == SHN_UNDEF || strncmp(name, "bionic_", 7))
+		return;
+	char *copy = strdup(name + 7);
+	if (!copy || *(char **)tsearch(copy, &wrapper_names, wrapper_names_cmp) != copy)
+		free(copy);
+}
+
+static int wrapper_names_collect(struct dl_phdr_info *info, size_t size, void *data)
+{
+	const ElfW(Dyn) *dyn = NULL;
+	const char *strtab = NULL;
+	const ElfW(Sym) *symtab = NULL;
+	const uint32_t *gnu_hash = NULL;
+	const uint32_t *sysv_hash = NULL;
+
+	for (size_t i = 0; i < info->dlpi_phnum; i++)
+		if (info->dlpi_phdr[i].p_type == PT_DYNAMIC)
+			dyn = (const ElfW(Dyn) *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+	if (!dyn)
+		return 0;
+
+	for (; dyn->d_tag != DT_NULL; dyn++) {
+		ElfW(Addr) ptr = dyn->d_un.d_ptr;
+		/* glibc relocates these entries in place, musl does not */
+		if (ptr < info->dlpi_addr)
+			ptr += info->dlpi_addr;
+		switch (dyn->d_tag) {
+			case DT_STRTAB: strtab = (const char *)ptr; break;
+			case DT_SYMTAB: symtab = (const ElfW(Sym) *)ptr; break;
+			case DT_GNU_HASH: gnu_hash = (const uint32_t *)ptr; break;
+			case DT_HASH: sysv_hash = (const uint32_t *)ptr; break;
+		}
+	}
+	if (!strtab || !symtab)
+		return 0;
+
+	if (gnu_hash) {
+		uint32_t nbucket = gnu_hash[0], symoffset = gnu_hash[1], maskwords = gnu_hash[2];
+		const uint32_t *bucket = gnu_hash + 4 + maskwords * (sizeof(ElfW(Addr)) / 4);
+		const uint32_t *chain = bucket + nbucket - symoffset;
+		for (uint32_t b = 0; b < nbucket; b++) {
+			uint32_t n = bucket[b];
+			if (n == 0)
+				continue;
+			do
+				wrapper_names_add(strtab, symtab + n);
+			while ((chain[n++] & 1) == 0);
+		}
+	} else if (sysv_hash) {
+		for (uint32_t n = 1; n < sysv_hash[1]; n++)
+			wrapper_names_add(strtab, symtab + n);
+	}
+
+	return 0;
+}
+
+static int wrapper_names_generation(struct dl_phdr_info *info, size_t size, void *data)
+{
+	unsigned long long *gen = data;
+	gen[0] = info->dlpi_adds;
+	gen[1] = info->dlpi_subs;
+	return 1;
+}
+
+static void wrapper_names_update(void)
+{
+	unsigned long long gen[2] = { 0, 0 };
+	dl_iterate_phdr(wrapper_names_generation, gen);
+	if (wrapper_names && gen[0] == wrapper_names_adds && gen[1] == wrapper_names_subs)
+		return;
+	tdestroy(wrapper_names, free);
+	wrapper_names = NULL;
+	dl_iterate_phdr(wrapper_names_collect, NULL);
+	wrapper_names_adds = gen[0];
+	wrapper_names_subs = gen[1];
+}
+
+
 static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 {
 	ElfW(Sym) *s;
 	ElfW(Addr) base;
+
+	wrapper_names_update();
 
 	for (size_t idx = 0; idx < count; ++idx, ++rel) {
 
@@ -1826,8 +1924,11 @@ static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 			 * library heads its local group and libc (which the bionic_ wrappers stand in for)
 			 * only follows as one of its DT_NEEDED libraries. It is also the cheap lookup: the
 			 * dlsym(RTLD_DEFAULT) for the wrapper walks every object in the process, which for a
-			 * library resolving tens of thousands of its own symbols took several 100 ms. */
-			if ((s = apkenv__elf_lookup(si, &own_name))) {
+			 * library resolving tens of thousands of its own symbols took several 100 ms.
+			 * Names that have a bionic_ wrapper keep resolving to the wrapper, so a library that
+			 * carries its own copy of a wrapped function still goes through the translation. */
+			s = apkenv__elf_lookup(si, &own_name);
+			if (s && !tfind(sym_name, &wrapper_names, wrapper_names_cmp)) {
 				base = si->base;
 				apkenv_last_library_used = si->name;
 			} else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
