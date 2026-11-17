@@ -7,6 +7,7 @@
 
 
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 
 #include <assert.h>
@@ -248,6 +249,17 @@ ssize_t bionic___write_chk(int fd, const void* buf, size_t count, size_t buf_siz
 	}
 
 	return write(fd, buf, count);
+}
+
+/* bionic fortify.cpp __sendto_chk() with __check_buffer_access(); glibc has no __sendto_chk */
+ssize_t bionic___sendto_chk(int socket, const void *buf, size_t len, size_t buflen,
+                            int flags, const struct sockaddr *dest_addr, socklen_t addrlen)
+{
+	if (__builtin_expect(len > buflen, 0)) {
+		fprintf(stderr, "sendto: prevented %zu-byte read from %zu-byte buffer\n", len, buflen);
+		abort();
+	}
+	return sendto(socket, buf, len, flags, dest_addr, addrlen);
 }
 
 /* NOTE: fortify level 2 is not meant for production, so arguably if some app uses it we should
