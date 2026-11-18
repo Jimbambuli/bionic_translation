@@ -9,6 +9,7 @@
 #include <netdb.h> // h_errno
 #include <setjmp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -217,16 +218,21 @@ glibc_dirent_to_bionic_dirent(const struct dirent *de, struct bionic_dirent *bde
 	strncpy(bde->d_name, de->d_name, sizeof(bde->d_name) - 1);
 }
 
+/* bionic's dirent is glibc's dirent64 (ino64, off64, reclen, type, name[256]) */
+_Static_assert(sizeof(struct bionic_dirent) == sizeof(struct dirent64), "dirent64 layout differs");
+_Static_assert(offsetof(struct bionic_dirent, d_ino) == offsetof(struct dirent64, d_ino), "dirent64 layout differs");
+_Static_assert(offsetof(struct bionic_dirent, d_off) == offsetof(struct dirent64, d_off), "dirent64 layout differs");
+_Static_assert(offsetof(struct bionic_dirent, d_reclen) == offsetof(struct dirent64, d_reclen), "dirent64 layout differs");
+_Static_assert(offsetof(struct bionic_dirent, d_type) == offsetof(struct dirent64, d_type), "dirent64 layout differs");
+_Static_assert(offsetof(struct bionic_dirent, d_name) == offsetof(struct dirent64, d_name), "dirent64 layout differs");
+
+/* Like bionic, return the entry inside the stream's own buffer: it stays valid until the next readdir() on the
+ * same stream. A shared static copy was overwritten by readdir() on any other stream, e.g. a nested one. */
 struct bionic_dirent *
 bionic_readdir(DIR *dirp)
 {
 	assert(dirp);
-	static struct bionic_dirent bde;
-	struct dirent *de;
-	if (!(de = readdir(dirp)))
-		return NULL;
-	glibc_dirent_to_bionic_dirent(de, &bde);
-	return &bde;
+	return (struct bionic_dirent *)readdir64(dirp);
 }
 
 // readdir_r is deprecated in glibc, but as long as it exists, it makes sense to use it for implementing the bionic variant
