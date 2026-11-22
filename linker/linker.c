@@ -152,6 +152,11 @@ static inline int apkenv_validate_soinfo(soinfo *si)
 static char apkenv_ldpaths_buf[LDPATH_BUFSIZE];
 static const char *apkenv_ldpaths[LDPATH_MAX + 1];
 
+/* set by bionic_android_dlopen_ext for the next library it loads, under apkenv_dl_lock */
+void *apkenv_dlext_reserved_addr;
+size_t apkenv_dlext_reserved_size;
+bool apkenv_dlext_reserved_hint;
+
 static const char *apkenv_ldpreload_names[LDPRELOAD_MAX + 1];
 
 static soinfo *apkenv_preloads[LDPRELOAD_MAX + 1];
@@ -1440,6 +1445,24 @@ apkenv_load_library(const char *name, const bool try_glibc, int glibc_flag, void
 	req_base = apkenv_get_lib_extents(fd, name, bytes, &ext_sz);
 	if (req_base == (intptr_t)-1)
 		goto fail;
+
+	/* android_dlopen_ext(ANDROID_DLEXT_RESERVED_ADDRESS[_HINT]): like the bionic linker
+	 * (ElfReader::ReserveAddressSpace), load the requested library into the caller's reserved
+	 * region if it fits; without _HINT a region that is too small is an error. It applies to
+	 * this library only, not to its DT_NEEDED libraries. */
+	if (apkenv_dlext_reserved_addr) {
+		void *reserved_addr = apkenv_dlext_reserved_addr;
+		size_t reserved_size = apkenv_dlext_reserved_size;
+		bool hint = apkenv_dlext_reserved_hint;
+		apkenv_dlext_reserved_addr = NULL;
+		if (ext_sz <= reserved_size) {
+			req_base = (intptr_t)reserved_addr;
+		} else if (!hint) {
+			DL_ERR("reserved address space %zd smaller than %zd bytes needed for \"%s\"",
+			       reserved_size, ext_sz, name);
+			goto fail;
+		}
+	}
 	TRACE("[ %5d - '%s' (%s) wants base=0x%016lx sz=0x%016lx ]\n", apkenv_pid, name,
 	      (req_base ? "prelinked" : "not pre-linked"), req_base, ext_sz);
 

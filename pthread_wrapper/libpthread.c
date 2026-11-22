@@ -45,7 +45,6 @@ typedef struct {
 			char __reserved[16];
 #endif
 		} bionic;
-		pthread_attr_t *glibc;
 	};
 } bionic_attr_t;
 
@@ -382,112 +381,233 @@ int bionic_pthread_rwlock_wrlock(bionic_rwlock_t *rwlock)
 
 /* attr */
 
-int bionic_pthread_attr_destroy(bionic_attr_t *attr)
-{
-	assert(attr);
-	int ret = 0;
-	if (IS_MAPPED(attr)) {
-		ret = pthread_attr_destroy(attr->glibc);
-		UNMAP(attr);
-	}
-	return ret;
-}
+/* pthread_attr_t is a public struct in bionic (<pthread.h>): its fields are part of the ABI, and bionic code
+ * reads and writes them directly (e.g. Berberis' pthread_create for a guest thread). So the attributes live in
+ * bionic's layout, handled as bionic/libc/bionic/pthread_attr.cpp does; pthread_create() and
+ * pthread_getattr_np() translate to and from glibc's attributes. */
+#define BIONIC_PTHREAD_ATTR_FLAG_DETACHED 0x00000001
+#define BIONIC_PTHREAD_ATTR_FLAG_INHERIT  0x00000004
+#define BIONIC_PTHREAD_ATTR_FLAG_EXPLICIT 0x00000008
+#define BIONIC_PTHREAD_CREATE_JOINABLE 0
+#define BIONIC_PTHREAD_CREATE_DETACHED 1
+#define BIONIC_PTHREAD_INHERIT_SCHED  0
+#define BIONIC_PTHREAD_EXPLICIT_SCHED 1
+#define BIONIC_PTHREAD_SCOPE_SYSTEM  0
+#define BIONIC_PTHREAD_SCOPE_PROCESS 1
+#if defined(__LP64__)
+#define BIONIC_PTHREAD_STACK_MIN 16384
+#define BIONIC_SIGNAL_STACK_SIZE_WITHOUT_GUARD (32 * 1024)
+#else
+#define BIONIC_PTHREAD_STACK_MIN 8192
+#define BIONIC_SIGNAL_STACK_SIZE_WITHOUT_GUARD (16 * 1024)
+#endif
+#define BIONIC_PTHREAD_STACK_SIZE_DEFAULT ((1 * 1024 * 1024) - BIONIC_SIGNAL_STACK_SIZE_WITHOUT_GUARD)
 
 int bionic_pthread_attr_init(bionic_attr_t *attr)
 {
-	assert(attr);
-	// From PTHREAD_ATTR_INIT(3)
-	// Calling `pthread_attr_init` on a thread attributes object that has already been initialized results in ud.
-	*attr = (bionic_attr_t){0};
-	attr->glibc = mmap(NULL, sizeof(*attr->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-	return pthread_attr_init(attr->glibc);
+	attr->bionic.flags = 0;
+	attr->bionic.stack_base = NULL;
+	attr->bionic.stack_size = BIONIC_PTHREAD_STACK_SIZE_DEFAULT;
+	attr->bionic.guard_size = sysconf(_SC_PAGESIZE);
+	attr->bionic.sched_policy = SCHED_OTHER; /* SCHED_NORMAL */
+	attr->bionic.sched_priority = 0;
+	return 0;
 }
 
-int bionic_pthread_getattr_np(bionic_pthread_t thread, bionic_attr_t *attr)
+int bionic_pthread_attr_destroy(bionic_attr_t *attr)
 {
-	assert(thread && attr);
-	*attr = (bionic_attr_t){0};
-	attr->glibc = mmap(NULL, sizeof(*attr->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-	return pthread_getattr_np((pthread_t)thread, attr->glibc);
+	memset(attr, 0x42, sizeof(*attr));
+	return 0;
 }
 
-int bionic_pthread_attr_settstack(bionic_attr_t *attr, void *stackaddr, size_t stacksize)
+int bionic_pthread_attr_setinheritsched(bionic_attr_t *attr, int flag)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_setstack(attr->glibc, stackaddr, stacksize);
-}
-
-int bionic_pthread_attr_getstack(const bionic_attr_t *attr, void *stackaddr, size_t *stacksize)
-{
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_getstack(attr->glibc, stackaddr, stacksize);
-}
-
-#if defined(__LP64__)
-#define BIONIC_PTHREAD_STACK_MIN 16384
-#else
-#define BIONIC_PTHREAD_STACK_MIN 8192
-#endif
-
-int bionic_pthread_attr_setstacksize(bionic_attr_t *attr, size_t stacksize)
-{
-	assert(attr && IS_MAPPED(attr));
-	
-	if (stacksize < BIONIC_PTHREAD_STACK_MIN)
+	if (flag == BIONIC_PTHREAD_EXPLICIT_SCHED) {
+		attr->bionic.flags &= ~BIONIC_PTHREAD_ATTR_FLAG_INHERIT;
+		attr->bionic.flags |= BIONIC_PTHREAD_ATTR_FLAG_EXPLICIT;
+	} else if (flag == BIONIC_PTHREAD_INHERIT_SCHED) {
+		attr->bionic.flags |= BIONIC_PTHREAD_ATTR_FLAG_INHERIT;
+		attr->bionic.flags &= ~BIONIC_PTHREAD_ATTR_FLAG_EXPLICIT;
+	} else {
 		return EINVAL;
-
-	if (stacksize < PTHREAD_STACK_MIN)
-		stacksize = PTHREAD_STACK_MIN;
-
-	return pthread_attr_setstacksize(attr->glibc, stacksize);
+	}
+	return 0;
 }
 
-int bionic_pthread_attr_getstacksize(const bionic_attr_t *attr, size_t *stacksize)
+int bionic_pthread_attr_getinheritsched(const bionic_attr_t *attr, int *flag)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_getstacksize(attr->glibc, stacksize);
+	if (attr->bionic.flags & BIONIC_PTHREAD_ATTR_FLAG_INHERIT)
+		*flag = BIONIC_PTHREAD_INHERIT_SCHED;
+	else if (attr->bionic.flags & BIONIC_PTHREAD_ATTR_FLAG_EXPLICIT)
+		*flag = BIONIC_PTHREAD_EXPLICIT_SCHED;
+	else /* the behaviour before setinheritsched existed */
+		*flag = (attr->bionic.sched_policy != SCHED_OTHER) ? BIONIC_PTHREAD_EXPLICIT_SCHED : BIONIC_PTHREAD_INHERIT_SCHED;
+	return 0;
+}
+
+int bionic_pthread_attr_setdetachstate(bionic_attr_t *attr, int state)
+{
+	if (state == BIONIC_PTHREAD_CREATE_DETACHED)
+		attr->bionic.flags |= BIONIC_PTHREAD_ATTR_FLAG_DETACHED;
+	else if (state == BIONIC_PTHREAD_CREATE_JOINABLE)
+		attr->bionic.flags &= ~BIONIC_PTHREAD_ATTR_FLAG_DETACHED;
+	else
+		return EINVAL;
+	return 0;
+}
+
+int bionic_pthread_attr_getdetachstate(const bionic_attr_t *attr, int *state)
+{
+	*state = (attr->bionic.flags & BIONIC_PTHREAD_ATTR_FLAG_DETACHED) ? BIONIC_PTHREAD_CREATE_DETACHED : BIONIC_PTHREAD_CREATE_JOINABLE;
+	return 0;
 }
 
 int bionic_pthread_attr_setschedpolicy(bionic_attr_t *attr, int policy)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_setschedpolicy(attr->glibc, policy);
+	attr->bionic.sched_policy = policy;
+	return 0;
 }
 
-int bionic_pthread_attr_getschedpolicy(bionic_attr_t *attr, int *policy)
+int bionic_pthread_attr_getschedpolicy(const bionic_attr_t *attr, int *policy)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_getschedpolicy(attr->glibc, policy);
+	*policy = attr->bionic.sched_policy;
+	return 0;
 }
 
 int bionic_pthread_attr_setschedparam(bionic_attr_t *attr, const struct sched_param *param)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_setschedparam(attr->glibc, param);
+	attr->bionic.sched_priority = param->sched_priority;
+	return 0;
 }
 
-int bionic_pthread_attr_getschedparam(bionic_attr_t *attr, struct sched_param *param)
+int bionic_pthread_attr_getschedparam(const bionic_attr_t *attr, struct sched_param *param)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_getschedparam(attr->glibc, param);
+	param->sched_priority = attr->bionic.sched_priority;
+	return 0;
 }
 
-int bionic_pthread_attr_setdetachstate(bionic_attr_t *attr, int detachstate)
+int bionic_pthread_attr_setstacksize(bionic_attr_t *attr, size_t stack_size)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_setdetachstate(attr->glibc, detachstate);
+	if (stack_size < BIONIC_PTHREAD_STACK_MIN)
+		return EINVAL;
+	attr->bionic.stack_size = stack_size;
+	return 0;
 }
 
-int bionic_pthread_attr_getdetachstate(bionic_attr_t *attr, int *detachstate)
+int bionic_pthread_attr_getstack(const bionic_attr_t *attr, void **stack_base, size_t *stack_size)
 {
-	assert(attr && IS_MAPPED(attr));
-	return pthread_attr_getdetachstate(attr->glibc, detachstate);
+	*stack_base = attr->bionic.stack_base;
+	*stack_size = attr->bionic.stack_size;
+	return 0;
+}
+
+int bionic_pthread_attr_getstacksize(const bionic_attr_t *attr, size_t *stack_size)
+{
+	void *unused;
+	return bionic_pthread_attr_getstack(attr, &unused, stack_size);
+}
+
+int bionic_pthread_attr_setstack(bionic_attr_t *attr, void *stack_base, size_t stack_size)
+{
+	size_t page_size = sysconf(_SC_PAGESIZE);
+	if ((stack_size & (page_size - 1)) || stack_size < BIONIC_PTHREAD_STACK_MIN)
+		return EINVAL;
+	if ((uintptr_t)stack_base & (page_size - 1))
+		return EINVAL;
+	attr->bionic.stack_base = stack_base;
+	attr->bionic.stack_size = stack_size;
+	return 0;
+}
+
+int bionic_pthread_attr_setguardsize(bionic_attr_t *attr, size_t guard_size)
+{
+	attr->bionic.guard_size = guard_size;
+	return 0;
+}
+
+int bionic_pthread_attr_getguardsize(const bionic_attr_t *attr, size_t *guard_size)
+{
+	*guard_size = attr->bionic.guard_size;
+	return 0;
+}
+
+int bionic_pthread_attr_setscope(bionic_attr_t *attr, int scope)
+{
+	(void)attr;
+	if (scope == BIONIC_PTHREAD_SCOPE_SYSTEM)
+		return 0;
+	if (scope == BIONIC_PTHREAD_SCOPE_PROCESS)
+		return ENOTSUP;
+	return EINVAL;
+}
+
+int bionic_pthread_attr_getscope(const bionic_attr_t *attr, int *scope)
+{
+	(void)attr;
+	*scope = BIONIC_PTHREAD_SCOPE_SYSTEM;
+	return 0;
+}
+
+int bionic_pthread_getattr_np(bionic_pthread_t thread, bionic_attr_t *attr)
+{
+	pthread_attr_t glibc_attr;
+	int ret = pthread_getattr_np((pthread_t)thread, &glibc_attr);
+	if (ret)
+		return ret;
+	int detach_state, policy;
+	struct sched_param param;
+	bionic_pthread_attr_init(attr);
+	pthread_attr_getstack(&glibc_attr, &attr->bionic.stack_base, &attr->bionic.stack_size);
+	pthread_attr_getguardsize(&glibc_attr, &attr->bionic.guard_size);
+	if (!pthread_attr_getdetachstate(&glibc_attr, &detach_state) && detach_state == PTHREAD_CREATE_DETACHED)
+		attr->bionic.flags |= BIONIC_PTHREAD_ATTR_FLAG_DETACHED;
+	if (!pthread_attr_getschedpolicy(&glibc_attr, &policy))
+		attr->bionic.sched_policy = policy;
+	if (!pthread_attr_getschedparam(&glibc_attr, &param))
+		attr->bionic.sched_priority = param.sched_priority;
+	pthread_attr_destroy(&glibc_attr);
+	return 0;
+}
+
+/* glibc attributes for a thread with these bionic ones (bionic's pthread_create: user stack, guard,
+ * detach state, and the scheduling it sets on the new thread) */
+static int to_glibc_attr(const bionic_attr_t *attr, pthread_attr_t *glibc_attr)
+{
+	int ret = pthread_attr_init(glibc_attr);
+	if (ret)
+		return ret;
+	pthread_attr_setdetachstate(glibc_attr, (attr->bionic.flags & BIONIC_PTHREAD_ATTR_FLAG_DETACHED) ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE);
+	if (attr->bionic.stack_base) {
+		ret = pthread_attr_setstack(glibc_attr, attr->bionic.stack_base, attr->bionic.stack_size);
+	} else {
+		ret = pthread_attr_setstacksize(glibc_attr, attr->bionic.stack_size < PTHREAD_STACK_MIN ? PTHREAD_STACK_MIN : attr->bionic.stack_size);
+		if (!ret)
+			ret = pthread_attr_setguardsize(glibc_attr, attr->bionic.guard_size);
+	}
+	bool explicit_sched = (attr->bionic.flags & BIONIC_PTHREAD_ATTR_FLAG_EXPLICIT) ||
+	                      (!(attr->bionic.flags & BIONIC_PTHREAD_ATTR_FLAG_INHERIT) && attr->bionic.sched_policy != SCHED_OTHER);
+	if (!ret && explicit_sched) {
+		struct sched_param param = { .sched_priority = attr->bionic.sched_priority };
+		pthread_attr_setinheritsched(glibc_attr, PTHREAD_EXPLICIT_SCHED);
+		pthread_attr_setschedpolicy(glibc_attr, attr->bionic.sched_policy);
+		pthread_attr_setschedparam(glibc_attr, &param);
+	}
+	if (ret)
+		pthread_attr_destroy(glibc_attr);
+	return ret;
 }
 
 int bionic_pthread_create(bionic_pthread_t *thread, const bionic_attr_t *attr, void* (*start)(void*), void *arg)
 {
-	assert(thread && (!attr || IS_MAPPED(attr)));
-	return pthread_create((pthread_t*)thread, (attr ? attr->glibc : NULL), start, arg);
+	if (!attr)
+		return pthread_create((pthread_t *)thread, NULL, start, arg);
+	pthread_attr_t glibc_attr;
+	int ret = to_glibc_attr(attr, &glibc_attr);
+	if (ret)
+		return ret;
+	ret = pthread_create((pthread_t *)thread, &glibc_attr, start, arg);
+	pthread_attr_destroy(&glibc_attr);
+	return ret;
 }
 
 /* bionic pthread_gettid_np(): the kernel thread id of a thread. glibc has it from 2.42 on; before, the

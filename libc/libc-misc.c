@@ -260,3 +260,165 @@ char* bionic___gnu_strerror_r(int error_number, char* buf, size_t buf_len) {
 	return buf;
 #endif
 }
+
+/* BSD's getprogname() as bionic has it: the name the process was started with, without the path */
+const char *bionic_getprogname(void)
+{
+	return program_invocation_short_name;
+}
+
+/* android_mallopt (bionic/libc/bionic/android_mallopt.cpp, Android 16) on top of the host's malloc:
+ * there is no malloc debug, heapprofd, GWP-ASan, MTE or allocation limit, so the queries answer
+ * "off" and the requests that need one of them fail with ENOTSUP, as bionic does without them */
+enum {
+	M_INIT_ZYGOTE_CHILD_PROFILING = 1,
+	M_RESET_HOOKS = 2,
+	M_SET_ALLOCATION_LIMIT_BYTES = 3,
+	M_SET_ZYGOTE_CHILD = 4,
+	M_WRITE_MALLOC_LEAK_INFO_TO_FILE = 5,
+	M_GET_MALLOC_LEAK_INFO = 6,
+	M_FREE_MALLOC_LEAK_INFO = 7,
+	M_GET_PROCESS_PROFILEABLE = 9,
+	M_INITIALIZE_GWP_ASAN = 10,
+	M_MEMTAG_STACK_IS_ON = 11,
+	M_GET_DECAY_TIME_ENABLED = 12,
+};
+
+typedef struct {
+	uint8_t *buffer;
+	size_t overall_size;
+	size_t info_size;
+	size_t total_memory;
+	size_t backtrace_size;
+} android_mallopt_leak_info_t;
+
+typedef struct {
+	const char *program_name;
+	int desire;
+} android_mallopt_gwp_asan_options_t;
+
+static bool zygote_child;
+static _Atomic bool zygote_child_profileable;
+
+bool android_mallopt(int opcode, void *arg, size_t arg_size)
+{
+	switch (opcode) {
+		case M_GET_DECAY_TIME_ENABLED:
+		case M_MEMTAG_STACK_IS_ON:
+			if (!arg || arg_size != sizeof(bool)) {
+				errno = EINVAL;
+				return false;
+			}
+			*(bool *)arg = false;
+			return true;
+		case M_INITIALIZE_GWP_ASAN:
+			if (!arg || arg_size != sizeof(android_mallopt_gwp_asan_options_t)) {
+				errno = EINVAL;
+				return false;
+			}
+			return false; /* GWP-ASan was not enabled */
+		case M_SET_ZYGOTE_CHILD:
+			if (arg || arg_size != 0) {
+				errno = EINVAL;
+				return false;
+			}
+			zygote_child = true;
+			return true;
+		case M_INIT_ZYGOTE_CHILD_PROFILING:
+			if (arg || arg_size != 0) {
+				errno = EINVAL;
+				return false;
+			}
+			zygote_child_profileable = true;
+			return true;
+		case M_GET_PROCESS_PROFILEABLE:
+			if (!arg || arg_size != sizeof(bool)) {
+				errno = EINVAL;
+				return false;
+			}
+			*(bool *)arg = !zygote_child || zygote_child_profileable;
+			return true;
+		case M_WRITE_MALLOC_LEAK_INFO_TO_FILE:
+			if (!arg || arg_size != sizeof(FILE *)) {
+				errno = EINVAL;
+				return false;
+			}
+			fprintf((FILE *)arg, "Native heap dump not available. To enable, run these commands (requires root):\n"
+			                     "# adb shell stop\n"
+			                     "# adb shell setprop libc.debug.malloc.options backtrace\n"
+			                     "# adb shell start\n");
+			errno = ENOTSUP;
+			return false;
+		case M_GET_MALLOC_LEAK_INFO:
+		case M_FREE_MALLOC_LEAK_INFO:
+			if (!arg || arg_size != sizeof(android_mallopt_leak_info_t)) {
+				errno = EINVAL;
+				return false;
+			}
+			errno = ENOTSUP;
+			return false;
+		case M_SET_ALLOCATION_LIMIT_BYTES: /* needs bionic's malloc dispatch */
+		default:
+			errno = ENOTSUP;
+			return false;
+	}
+}
+
+/* crash details (bionic/libc/bionic/android_crash_detail.cpp) are read by debuggerd into the
+ * tombstone; there is no debuggerd, but the handles behave the same: name and data are not copied */
+typedef struct crash_detail_t {
+	const char *name;
+	size_t name_size;
+	const char *data;
+	size_t data_size;
+} crash_detail_t;
+
+crash_detail_t *android_crash_detail_register(const void *name, size_t name_size, const void *data, size_t data_size)
+{
+	crash_detail_t *detail = malloc(sizeof(*detail));
+	if (!detail)
+		return NULL;
+	detail->name = name;
+	detail->name_size = name_size;
+	detail->data = data;
+	detail->data_size = data_size;
+	return detail;
+}
+
+void android_crash_detail_unregister(crash_detail_t *crash_detail)
+{
+	free(crash_detail);
+}
+
+void android_crash_detail_replace_data(crash_detail_t *crash_detail, const void *data, size_t data_size)
+{
+	crash_detail->data = data;
+	crash_detail->data_size = data_size;
+}
+
+void android_crash_detail_replace_name(crash_detail_t *crash_detail, const void *name, size_t name_size)
+{
+	crash_detail->name = name;
+	crash_detail->name_size = name_size;
+}
+
+/* bionic's heap inspection API (malloc_common.cpp: malloc_disable, malloc_enable, malloc_iterate), used by heap
+ * walkers such as libmemunreachable. The host's malloc (glibc) can neither be locked from outside nor walked, so
+ * disable/enable have nothing to do and malloc_iterate fails like bionic without such an allocator. */
+void malloc_disable(void)
+{
+}
+
+void malloc_enable(void)
+{
+}
+
+int malloc_iterate(uintptr_t base, size_t size, void (*callback)(uintptr_t base, size_t size, void *arg), void *arg)
+{
+	(void)base;
+	(void)size;
+	(void)callback;
+	(void)arg;
+	errno = ENOTSUP;
+	return -1;
+}
