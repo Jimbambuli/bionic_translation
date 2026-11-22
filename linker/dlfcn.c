@@ -130,6 +130,68 @@ void *bionic_android_dlopen_ext(const char *filename, int flags, const struct an
 	return ret;
 }
 
+/* libdl_android (bionic/libdl/libdl_android.cpp): the linker namespace API. This linker has one
+ * namespace, the one ATL configures with the app's library directory; every namespace a caller
+ * creates or asks for stands for it, so linking namespaces has nothing to do. */
+struct android_namespace_t {
+	const char *name;
+};
+
+static struct android_namespace_t default_namespace = { .name = "default" };
+
+struct android_namespace_t *bionic_android_create_namespace(const char *name, const char *ld_library_path,
+                                                            const char *default_library_path, uint64_t type,
+                                                            const char *permitted_when_isolated_path,
+                                                            struct android_namespace_t *parent)
+{
+	(void)ld_library_path;
+	(void)default_library_path;
+	(void)type;
+	(void)permitted_when_isolated_path;
+	(void)parent;
+	struct android_namespace_t *ns = malloc(sizeof(*ns));
+	if (!ns)
+		return NULL;
+	ns->name = strdup(name ? name : "(anonymous)");
+	return ns;
+}
+
+bool bionic_android_link_namespaces(struct android_namespace_t *namespace_from, struct android_namespace_t *namespace_to,
+                                    const char *shared_libs_sonames)
+{
+	(void)namespace_from;
+	(void)namespace_to;
+	(void)shared_libs_sonames;
+	return true;
+}
+
+bool bionic_android_init_anonymous_namespace(const char *shared_libs_sonames, const char *library_search_path)
+{
+	(void)shared_libs_sonames;
+	(void)library_search_path;
+	return true;
+}
+
+struct android_namespace_t *bionic_android_get_exported_namespace(const char *name)
+{
+	(void)name;
+	return &default_namespace;
+}
+
+/* set by the runtime (VMRuntime.setTargetSdkVersion), read by libc and the linker for compatibility
+ * behaviour; __ANDROID_API_FUTURE__ until set, as bionic's linker */
+static _Atomic int target_sdk_version = 10000;
+
+void bionic_android_set_application_target_sdk_version(int target)
+{
+	target_sdk_version = target == 0 ? 10000 : target;
+}
+
+int bionic_android_get_application_target_sdk_version(void)
+{
+	return target_sdk_version;
+}
+
 const char *bionic_dlerror(void)
 {
 	const char *tmp = dl_err_str;

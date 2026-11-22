@@ -458,6 +458,24 @@ int bionic_getaddrinfo(const char *hostname, const char *servname, const struct 
 	return result;
 }
 
+/* bionic's resolver entry points with a network (netid/mark or a net context): there is only the
+ * host's default network, so they resolve like getaddrinfo() */
+int bionic_android_getaddrinfofornet(const char *hostname, const char *servname, const struct bionic_addrinfo *hints,
+                                     unsigned netid, unsigned mark, struct bionic_addrinfo **res)
+{
+	(void)netid;
+	(void)mark;
+	return bionic_getaddrinfo(hostname, servname, hints, res);
+}
+
+struct android_net_context;
+int bionic_android_getaddrinfofornetcontext(const char *hostname, const char *servname, const struct bionic_addrinfo *hints,
+                                            const struct android_net_context *netcontext, struct bionic_addrinfo **res)
+{
+	(void)netcontext;
+	return bionic_getaddrinfo(hostname, servname, hints, res);
+}
+
 void bionic_freeaddrinfo(struct bionic_addrinfo *ai)
 {
 	struct bionic_addrinfo *it = ai;

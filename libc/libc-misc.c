@@ -2,80 +2,13 @@
 #include <locale.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* System properties. Android's init owns them and every process reads the same values. Here the host
- * runs no property service: the framework side (ATL's SystemProperties) publishes the ones native code
- * has to agree with it on (ro.build.version.*) through btl_system_property_set(), and native code
- * reads them with __system_property_get() / __system_property_find() + __system_property_read()
- * like on a device. Properties nobody published are unset: get() gives "" and 0, as in bionic. */
-#define PROP_NAME_MAX  32
+int __system_property_get(const char *name, char *value);
 #define PROP_VALUE_MAX 92
-
-struct stored_property {
-	char *name;
-	char value[PROP_VALUE_MAX];
-};
-
-#define MAX_STORED_PROPERTIES 16
-static struct stored_property stored_properties[MAX_STORED_PROPERTIES];
-static pthread_mutex_t stored_properties_lock = PTHREAD_MUTEX_INITIALIZER;
-
-// the lock must be held
-static struct stored_property *find_stored_property(const char *name)
-{
-	for (int i = 0; i < MAX_STORED_PROPERTIES && stored_properties[i].name; i++) {
-		if (!strcmp(stored_properties[i].name, name))
-			return &stored_properties[i];
-	}
-	return NULL;
-}
-
-// not part of bionic: called by the host (ATL) to publish a property; false when the table is full
-bool btl_system_property_set(const char *name, const char *value)
-{
-	bool ok = true;
-
-	pthread_mutex_lock(&stored_properties_lock);
-	struct stored_property *prop = find_stored_property(name);
-	for (int i = 0; !prop && i < MAX_STORED_PROPERTIES; i++) {
-		if (!stored_properties[i].name) {
-			stored_properties[i].name = strdup(name);
-			prop = &stored_properties[i];
-		}
-	}
-	if (prop) {
-		strncpy(prop->value, value, PROP_VALUE_MAX - 1);
-		prop->value[PROP_VALUE_MAX - 1] = 0;
-	} else {
-		ok = false;
-	}
-	pthread_mutex_unlock(&stored_properties_lock);
-	return ok;
-}
-
-static int get_stored_property(const char *name, char *value)
-{
-	int len = 0;
-
-	pthread_mutex_lock(&stored_properties_lock);
-	struct stored_property *prop = find_stored_property(name);
-	if (prop) {
-		strcpy(value, prop->value);
-		len = strlen(value);
-	} else {
-		*value = 0;
-	}
-	pthread_mutex_unlock(&stored_properties_lock);
-	return len;
-}
-
-int __system_property_get(const char *name, char *value)
-{
-	return get_stored_property(name, value);
-}
 
 // bionic's api-level.h: the inline before API 29 and libc's function since do the same
 int android_get_device_api_level(void)
@@ -85,35 +18,6 @@ int android_get_device_api_level(void)
 		return -1;
 	int api_level = atoi(value);
 	return (api_level > 0) ? api_level : -1;
-}
-
-// this seems to not be a stable ABI, so hopefully nobody treats it as such
-// FIXME: move this out into it's own file whenever we get to implementing it more properly
-struct prop_info {
-	const char *name;
-};
-
-const struct prop_info *bionic___system_property_find(const char *name)
-{
-	struct prop_info *ret = malloc(sizeof(struct prop_info));
-	ret->name = strdup(name);
-
-	return ret;
-}
-
-int bionic___system_property_read(const struct prop_info *prop_info, char *name, char *value)
-{
-	if (name)
-		strncpy(name, prop_info->name, PROP_NAME_MAX);
-
-	if (!value)
-		return 0;
-
-	int len = get_stored_property(prop_info->name, value);
-	if (!len && strcmp(prop_info->name, "ro.build.fingerprint")) // there is no good reason that apps should need the fingerprint, so it stays empty
-		printf("__system_property_find: >%s< not handled yet\n", prop_info->name);
-
-	return len;
 }
 
 // actually misc stuff
@@ -190,4 +94,145 @@ char* bionic___gnu_strerror_r(int error_number, char* buf, size_t buf_len) {
 	errno = saved_errno;
 	return buf;
 #endif
+}
+
+/* BSD's getprogname() as bionic has it: the name the process was started with, without the path */
+const char *bionic_getprogname(void)
+{
+	return program_invocation_short_name;
+}
+
+/* android_mallopt (bionic/libc/bionic/android_mallopt.cpp, Android 16) on top of the host's malloc:
+ * there is no malloc debug, heapprofd, GWP-ASan, MTE or allocation limit, so the queries answer
+ * "off" and the requests that need one of them fail with ENOTSUP, as bionic does without them */
+enum {
+	M_INIT_ZYGOTE_CHILD_PROFILING = 1,
+	M_RESET_HOOKS = 2,
+	M_SET_ALLOCATION_LIMIT_BYTES = 3,
+	M_SET_ZYGOTE_CHILD = 4,
+	M_WRITE_MALLOC_LEAK_INFO_TO_FILE = 5,
+	M_GET_MALLOC_LEAK_INFO = 6,
+	M_FREE_MALLOC_LEAK_INFO = 7,
+	M_GET_PROCESS_PROFILEABLE = 9,
+	M_INITIALIZE_GWP_ASAN = 10,
+	M_MEMTAG_STACK_IS_ON = 11,
+	M_GET_DECAY_TIME_ENABLED = 12,
+};
+
+typedef struct {
+	uint8_t *buffer;
+	size_t overall_size;
+	size_t info_size;
+	size_t total_memory;
+	size_t backtrace_size;
+} android_mallopt_leak_info_t;
+
+typedef struct {
+	const char *program_name;
+	int desire;
+} android_mallopt_gwp_asan_options_t;
+
+static bool zygote_child;
+static _Atomic bool zygote_child_profileable;
+
+bool android_mallopt(int opcode, void *arg, size_t arg_size)
+{
+	switch (opcode) {
+		case M_GET_DECAY_TIME_ENABLED:
+		case M_MEMTAG_STACK_IS_ON:
+			if (!arg || arg_size != sizeof(bool)) {
+				errno = EINVAL;
+				return false;
+			}
+			*(bool *)arg = false;
+			return true;
+		case M_INITIALIZE_GWP_ASAN:
+			if (!arg || arg_size != sizeof(android_mallopt_gwp_asan_options_t)) {
+				errno = EINVAL;
+				return false;
+			}
+			return false; /* GWP-ASan was not enabled */
+		case M_SET_ZYGOTE_CHILD:
+			if (arg || arg_size != 0) {
+				errno = EINVAL;
+				return false;
+			}
+			zygote_child = true;
+			return true;
+		case M_INIT_ZYGOTE_CHILD_PROFILING:
+			if (arg || arg_size != 0) {
+				errno = EINVAL;
+				return false;
+			}
+			zygote_child_profileable = true;
+			return true;
+		case M_GET_PROCESS_PROFILEABLE:
+			if (!arg || arg_size != sizeof(bool)) {
+				errno = EINVAL;
+				return false;
+			}
+			*(bool *)arg = !zygote_child || zygote_child_profileable;
+			return true;
+		case M_WRITE_MALLOC_LEAK_INFO_TO_FILE:
+			if (!arg || arg_size != sizeof(FILE *)) {
+				errno = EINVAL;
+				return false;
+			}
+			fprintf((FILE *)arg, "Native heap dump not available. To enable, run these commands (requires root):\n"
+			                     "# adb shell stop\n"
+			                     "# adb shell setprop libc.debug.malloc.options backtrace\n"
+			                     "# adb shell start\n");
+			errno = ENOTSUP;
+			return false;
+		case M_GET_MALLOC_LEAK_INFO:
+		case M_FREE_MALLOC_LEAK_INFO:
+			if (!arg || arg_size != sizeof(android_mallopt_leak_info_t)) {
+				errno = EINVAL;
+				return false;
+			}
+			errno = ENOTSUP;
+			return false;
+		case M_SET_ALLOCATION_LIMIT_BYTES: /* needs bionic's malloc dispatch */
+		default:
+			errno = ENOTSUP;
+			return false;
+	}
+}
+
+/* crash details (bionic/libc/bionic/android_crash_detail.cpp) are read by debuggerd into the
+ * tombstone; there is no debuggerd, but the handles behave the same: name and data are not copied */
+typedef struct crash_detail_t {
+	const char *name;
+	size_t name_size;
+	const char *data;
+	size_t data_size;
+} crash_detail_t;
+
+crash_detail_t *android_crash_detail_register(const void *name, size_t name_size, const void *data, size_t data_size)
+{
+	crash_detail_t *detail = malloc(sizeof(*detail));
+	if (!detail)
+		return NULL;
+	detail->name = name;
+	detail->name_size = name_size;
+	detail->data = data;
+	detail->data_size = data_size;
+	return detail;
+}
+
+void android_crash_detail_unregister(crash_detail_t *crash_detail)
+{
+	free(crash_detail);
+}
+
+void android_crash_detail_replace_data(crash_detail_t *crash_detail, const void *data, size_t data_size)
+{
+	crash_detail->data = data;
+	crash_detail->data_size = data_size;
+}
+
+void android_crash_detail_replace_name(crash_detail_t *crash_detail, const void *name, size_t name_size)
+{
+	crash_detail->name = name;
+	crash_detail->name_size = name_size;
 }
