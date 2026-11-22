@@ -237,6 +237,17 @@ ssize_t bionic___pwrite_chk(int fd, const void *buf, size_t count, off_t offset,
 	return pwrite(fd, buf, count, offset);
 }
 
+/* bionic fortify.cpp: __pwrite64_chk is __pwrite_chk with off64_t (LP64: off_t is 64 bits, like bionic___pread_chk) */
+ssize_t bionic___pwrite64_chk(int fd, const void *buf, size_t count, off_t offset, size_t buf_size)
+{
+	if (__builtin_expect(count > buf_size, 0)) {
+		fprintf(stderr, "pwrite64: prevented read past end of buffer");
+		abort();
+	}
+
+	return pwrite(fd, buf, count, offset);
+}
+
 ssize_t bionic___write_chk(int fd, const void* buf, size_t count, size_t buf_size) {
 	if (__builtin_expect(count > buf_size, 0)) {
 		fprintf(stderr, "write: prevented read past end of buffer");
