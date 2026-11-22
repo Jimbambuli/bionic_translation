@@ -236,3 +236,24 @@ void android_crash_detail_replace_name(crash_detail_t *crash_detail, const void 
 	crash_detail->name = name;
 	crash_detail->name_size = name_size;
 }
+
+/* bionic's heap inspection API (malloc_common.cpp: malloc_disable, malloc_enable, malloc_iterate), used by heap
+ * walkers such as libmemunreachable. The host's malloc (glibc) can neither be locked from outside nor walked, so
+ * disable/enable have nothing to do and malloc_iterate fails like bionic without such an allocator. */
+void malloc_disable(void)
+{
+}
+
+void malloc_enable(void)
+{
+}
+
+int malloc_iterate(uintptr_t base, size_t size, void (*callback)(uintptr_t base, size_t size, void *arg), void *arg)
+{
+	(void)base;
+	(void)size;
+	(void)callback;
+	(void)arg;
+	errno = ENOTSUP;
+	return -1;
+}
