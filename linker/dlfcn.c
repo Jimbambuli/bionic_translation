@@ -1,3 +1,5 @@
+#include <inttypes.h>
+#include <stdbool.h>
 /*
  * Copyright (C) 2007 The Android Open Source Project
  *
@@ -96,12 +98,36 @@ struct android_dlextinfo {
 	struct android_namespace_t* library_namespace;
 };
 
+/* android/dlext.h */
+#define ANDROID_DLEXT_RESERVED_ADDRESS 0x1
+#define ANDROID_DLEXT_RESERVED_ADDRESS_HINT 0x2
+#define ANDROID_DLEXT_FORCE_LOAD 0x40
+#define ANDROID_DLEXT_USE_NAMESPACE 0x200
+
+extern void *apkenv_dlext_reserved_addr;
+extern size_t apkenv_dlext_reserved_size;
+extern bool apkenv_dlext_reserved_hint;
+
 void *bionic_android_dlopen_ext(const char *filename, int flags, const struct android_dlextinfo *info)
 {
-	if (info) {
-		fprintf(stderr, "ERROR: android_dlopen_ext with android_dlextinfo not implemented\n");
-	}
-	return bionic_dlopen(filename, flags);
+	/* the shim linker has a single namespace and never loads a library twice, so USE_NAMESPACE
+	 * and FORCE_LOAD need no action */
+	const uint64_t handled = ANDROID_DLEXT_RESERVED_ADDRESS | ANDROID_DLEXT_RESERVED_ADDRESS_HINT |
+	                         ANDROID_DLEXT_FORCE_LOAD | ANDROID_DLEXT_USE_NAMESPACE;
+	if (info && (info->flags & ~handled))
+		fprintf(stderr, "ERROR: android_dlopen_ext: android_dlextinfo flags 0x%" PRIx64 " not implemented\n",
+		        info->flags & ~handled);
+	if (!info || !(info->flags & (ANDROID_DLEXT_RESERVED_ADDRESS | ANDROID_DLEXT_RESERVED_ADDRESS_HINT)))
+		return bionic_dlopen(filename, flags);
+
+	pthread_mutex_lock(&apkenv_dl_lock); /* recursive: bionic_dlopen takes it again */
+	apkenv_dlext_reserved_addr = info->reserved_addr;
+	apkenv_dlext_reserved_size = info->reserved_size;
+	apkenv_dlext_reserved_hint = !(info->flags & ANDROID_DLEXT_RESERVED_ADDRESS);
+	void *ret = bionic_dlopen(filename, flags);
+	apkenv_dlext_reserved_addr = NULL;
+	pthread_mutex_unlock(&apkenv_dl_lock);
+	return ret;
 }
 
 const char *bionic_dlerror(void)
