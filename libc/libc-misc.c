@@ -1,80 +1,178 @@
 #include <errno.h>
+#include <linux/futex.h>
 #include <locale.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 
 /* System properties. Android's init owns them and every process reads the same values. Here the host
  * runs no property service: the framework side (ATL's SystemProperties) publishes the ones native code
  * has to agree with it on (ro.build.version.*) through btl_system_property_set(), and native code
- * reads them with __system_property_get() / __system_property_find() + __system_property_read()
- * like on a device. Properties nobody published are unset: get() gives "" and 0, as in bionic. */
+ * reads them with bionic's read API (sys/system_properties.h) like on a device. Properties nobody
+ * published do not exist: find() gives NULL, get() gives "" and 0, foreach() does not see them.
+ * As in bionic (system_properties.cpp), a prop_info stays where it is once added, its serial holds the
+ * value length in the top 8 bits and a change counter below, and __system_property_wait() sleeps on the
+ * serial with a futex. */
 #define PROP_NAME_MAX  32
 #define PROP_VALUE_MAX 92
 
-struct stored_property {
+#define SERIAL_VALUE_LEN(serial) ((serial) >> 24)
+
+struct prop_info {
 	char *name;
 	char value[PROP_VALUE_MAX];
+	_Atomic uint32_t serial;
 };
 
 #define MAX_STORED_PROPERTIES 16
-static struct stored_property stored_properties[MAX_STORED_PROPERTIES];
+static struct prop_info stored_properties[MAX_STORED_PROPERTIES];
+static _Atomic uint32_t stored_properties_count;
+static _Atomic uint32_t area_serial; // the serial of the whole property area: changes on every add and update
 static pthread_mutex_t stored_properties_lock = PTHREAD_MUTEX_INITIALIZER;
 
-// the lock must be held
-static struct stored_property *find_stored_property(const char *name)
+static void futex_wake_all(_Atomic uint32_t *serial)
 {
-	for (int i = 0; i < MAX_STORED_PROPERTIES && stored_properties[i].name; i++) {
+	syscall(SYS_futex, serial, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
+}
+
+const struct prop_info *bionic___system_property_find(const char *name);
+
+// not part of bionic: called by the host (ATL) to publish a property; false when the table is full
+bool btl_system_property_set(const char *name, const char *value)
+{
+	bool ok = true;
+	uint32_t len = strnlen(value, PROP_VALUE_MAX - 1);
+
+	pthread_mutex_lock(&stored_properties_lock);
+	struct prop_info *pi = (struct prop_info *)bionic___system_property_find(name);
+	if (pi) {
+		uint32_t serial = atomic_load(&pi->serial) | 1; // dirty while the value changes
+		atomic_store(&pi->serial, serial);
+		memcpy(pi->value, value, len);
+		pi->value[len] = 0;
+		atomic_store(&pi->serial, (len << 24) | ((serial + 1) & 0xffffff));
+		futex_wake_all(&pi->serial);
+	} else if (atomic_load(&stored_properties_count) < MAX_STORED_PROPERTIES) {
+		pi = &stored_properties[atomic_load(&stored_properties_count)];
+		pi->name = strdup(name);
+		memcpy(pi->value, value, len);
+		pi->value[len] = 0;
+		atomic_store(&pi->serial, len << 24);
+		atomic_fetch_add(&stored_properties_count, 1); // readers see the entry only once it is complete
+	} else {
+		ok = false;
+	}
+	if (ok) {
+		atomic_fetch_add(&area_serial, 1);
+		futex_wake_all(&area_serial);
+	}
+	pthread_mutex_unlock(&stored_properties_lock);
+	return ok;
+}
+
+// the value and its serial, read again when a writer changed it meanwhile (ReadMutablePropertyValue)
+static uint32_t read_property_value(const struct prop_info *pi, char *value)
+{
+	uint32_t new_serial = atomic_load(&pi->serial);
+	uint32_t serial;
+	do {
+		serial = new_serial;
+		pthread_mutex_lock(&stored_properties_lock);
+		memcpy(value, pi->value, SERIAL_VALUE_LEN(serial) + 1);
+		pthread_mutex_unlock(&stored_properties_lock);
+		new_serial = atomic_load(&pi->serial);
+	} while (serial != new_serial || (serial & 1));
+	return serial;
+}
+
+const struct prop_info *bionic___system_property_find(const char *name)
+{
+	uint32_t count = atomic_load(&stored_properties_count);
+	for (uint32_t i = 0; i < count; i++) {
 		if (!strcmp(stored_properties[i].name, name))
 			return &stored_properties[i];
 	}
 	return NULL;
 }
 
-// not part of bionic: called by the host (ATL) to publish a property; false when the table is full
-bool btl_system_property_set(const char *name, const char *value)
+int bionic___system_property_read(const struct prop_info *pi, char *name, char *value)
 {
-	bool ok = true;
-
-	pthread_mutex_lock(&stored_properties_lock);
-	struct stored_property *prop = find_stored_property(name);
-	for (int i = 0; !prop && i < MAX_STORED_PROPERTIES; i++) {
-		if (!stored_properties[i].name) {
-			stored_properties[i].name = strdup(name);
-			prop = &stored_properties[i];
-		}
+	uint32_t serial = read_property_value(pi, value);
+	if (name) {
+		strncpy(name, pi->name, PROP_NAME_MAX - 1);
+		name[PROP_NAME_MAX - 1] = 0;
 	}
-	if (prop) {
-		strncpy(prop->value, value, PROP_VALUE_MAX - 1);
-		prop->value[PROP_VALUE_MAX - 1] = 0;
-	} else {
-		ok = false;
-	}
-	pthread_mutex_unlock(&stored_properties_lock);
-	return ok;
+	return SERIAL_VALUE_LEN(serial);
 }
 
-static int get_stored_property(const char *name, char *value)
+void bionic___system_property_read_callback(const struct prop_info *pi,
+                                            void (*callback)(void *cookie, const char *name, const char *value, uint32_t serial),
+                                            void *cookie)
 {
-	int len = 0;
-
-	pthread_mutex_lock(&stored_properties_lock);
-	struct stored_property *prop = find_stored_property(name);
-	if (prop) {
-		strcpy(value, prop->value);
-		len = strlen(value);
-	} else {
-		*value = 0;
-	}
-	pthread_mutex_unlock(&stored_properties_lock);
-	return len;
+	char value[PROP_VALUE_MAX];
+	uint32_t serial = read_property_value(pi, value);
+	callback(cookie, pi->name, value, serial);
 }
 
 int __system_property_get(const char *name, char *value)
 {
-	return get_stored_property(name, value);
+	const struct prop_info *pi = bionic___system_property_find(name);
+	if (pi)
+		return bionic___system_property_read(pi, NULL, value);
+	value[0] = 0;
+	return 0;
+}
+
+int bionic___system_property_foreach(void (*propfn)(const struct prop_info *pi, void *cookie), void *cookie)
+{
+	uint32_t count = atomic_load(&stored_properties_count);
+	for (uint32_t i = 0; i < count; i++)
+		propfn(&stored_properties[i], cookie);
+	return 0;
+}
+
+const struct prop_info *bionic___system_property_find_nth(unsigned n)
+{
+	return n < atomic_load(&stored_properties_count) ? &stored_properties[n] : NULL;
+}
+
+uint32_t bionic___system_property_serial(const struct prop_info *pi)
+{
+	return atomic_load(&pi->serial);
+}
+
+uint32_t bionic___system_property_area_serial(void)
+{
+	return atomic_load(&area_serial);
+}
+
+// pi NULL: wait for any property to change
+bool bionic___system_property_wait(const struct prop_info *pi, uint32_t old_serial, uint32_t *new_serial_ptr,
+                                   const struct timespec *relative_timeout)
+{
+	_Atomic uint32_t *serial_ptr = pi ? (_Atomic uint32_t *)&pi->serial : &area_serial;
+	uint32_t new_serial;
+	do {
+		if (syscall(SYS_futex, serial_ptr, FUTEX_WAIT, old_serial, relative_timeout, NULL, 0) == -1 && errno == ETIMEDOUT)
+			return false;
+		new_serial = atomic_load(serial_ptr);
+	} while (new_serial == old_serial);
+	*new_serial_ptr = new_serial;
+	return true;
+}
+
+uint32_t bionic___system_property_wait_any(uint32_t old_serial)
+{
+	uint32_t new_serial;
+	bionic___system_property_wait(NULL, old_serial, &new_serial, NULL);
+	return new_serial;
 }
 
 // bionic's api-level.h: the inline before API 29 and libc's function since do the same
@@ -85,35 +183,6 @@ int android_get_device_api_level(void)
 		return -1;
 	int api_level = atoi(value);
 	return (api_level > 0) ? api_level : -1;
-}
-
-// this seems to not be a stable ABI, so hopefully nobody treats it as such
-// FIXME: move this out into it's own file whenever we get to implementing it more properly
-struct prop_info {
-	const char *name;
-};
-
-const struct prop_info *bionic___system_property_find(const char *name)
-{
-	struct prop_info *ret = malloc(sizeof(struct prop_info));
-	ret->name = strdup(name);
-
-	return ret;
-}
-
-int bionic___system_property_read(const struct prop_info *prop_info, char *name, char *value)
-{
-	if (name)
-		strncpy(name, prop_info->name, PROP_NAME_MAX);
-
-	if (!value)
-		return 0;
-
-	int len = get_stored_property(prop_info->name, value);
-	if (!len && strcmp(prop_info->name, "ro.build.fingerprint")) // there is no good reason that apps should need the fingerprint, so it stays empty
-		printf("__system_property_find: >%s< not handled yet\n", prop_info->name);
-
-	return len;
 }
 
 // actually misc stuff
