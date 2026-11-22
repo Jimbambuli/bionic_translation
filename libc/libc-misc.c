@@ -1,4 +1,9 @@
 #include <errno.h>
+#include <linux/seccomp.h>
+#include <stdarg.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <locale.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -265,4 +270,34 @@ int malloc_iterate(uintptr_t base, size_t size, void (*callback)(uintptr_t base,
 	(void)arg;
 	errno = ENOTSUP;
 	return -1;
+}
+
+/* seccomp: an app's native code (Chromium's renderer and GPU processes) would install a filter written for bionic,
+ * which kills the process on the first syscall of glibc, GTK or ART it does not know (SIGSYS). The app's code sees a
+ * kernel without seccomp filters instead (seccomp() ENOSYS, prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER) EINVAL), as
+ * Chromium's SandboxBPF::SupportsSeccompSandbox() expects from such a kernel; ATL's own code is not affected. */
+long bionic_syscall(long number, ...)
+{
+	va_list ap;
+	va_start(ap, number);
+	long a[6];
+	for (int i = 0; i < 6; i++)
+		a[i] = va_arg(ap, long);
+	va_end(ap);
+#ifdef SYS_seccomp
+	if (number == SYS_seccomp) {
+		errno = ENOSYS;
+		return -1;
+	}
+#endif
+	return syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+
+int bionic_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5)
+{
+	if (option == PR_SET_SECCOMP && arg2 == SECCOMP_MODE_FILTER) {
+		errno = EINVAL;
+		return -1;
+	}
+	return prctl(option, arg2, arg3, arg4, arg5);
 }
