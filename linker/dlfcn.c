@@ -117,7 +117,8 @@ enum {
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
-void *bionic_dlsym(void *handle, const char *symbol)
+/* caller: the code that asked, for RTLD_NEXT (bionic: the libraries loaded after the caller's) */
+static void *dlsym_for_caller(void *handle, const char *symbol, const void *caller)
 {
 	verbose("bionic_dlsym(%p, %s) called\n", handle, symbol);
 
@@ -167,8 +168,7 @@ void *bionic_dlsym(void *handle, const char *symbol)
 	if (handle == RTLD_DEFAULT) {
 		sym = apkenv_lookup(symbol, &found, NULL);
 	} else if (handle == RTLD_NEXT) {
-		void *ret_addr = __builtin_return_address(0);
-		soinfo *si = apkenv_find_containing_library(ret_addr);
+		soinfo *si = apkenv_find_containing_library(caller);
 
 		sym = NULL;
 		if (si && si->next) {
@@ -211,6 +211,11 @@ err:
 	verbose("symbol %s has not been hooked\n", symbol);
 	pthread_mutex_unlock(&apkenv_dl_lock);
 	return 0;
+}
+
+void *bionic_dlsym(void *handle, const char *symbol)
+{
+	return dlsym_for_caller(handle, symbol, __builtin_return_address(0));
 }
 
 int bionic_dladdr(const void *addr, Dl_info *info)
@@ -264,6 +269,47 @@ int bionic_dlclose(void *handle)
 	(void)apkenv_unload_library((soinfo *)handle);
 	pthread_mutex_unlock(&apkenv_dl_lock);
 	return 0;
+}
+
+/* bionic's linker exports these (linker/dlfcn.cpp, __LINKER_PUBLIC__); libdl's dlopen() and the others call them with the
+ * caller's address, which picks the linker namespace. Apps look them up with dlsym() to load libraries as another caller
+ * (Facebook's libraries: dlsym(libdl.so, "__loader_dlopen")). There are no linker namespaces here. */
+void *bionic___loader_dlopen(const char *filename, int flags, const void *caller_addr)
+{
+	return bionic_dlopen(filename, flags);
+}
+
+void *bionic___loader_android_dlopen_ext(const char *filename, int flags, const struct android_dlextinfo *extinfo,
+                                         const void *caller_addr)
+{
+	return bionic_android_dlopen_ext(filename, flags, extinfo);
+}
+
+void *bionic___loader_dlsym(void *handle, const char *symbol, const void *caller_addr)
+{
+	return dlsym_for_caller(handle, symbol, caller_addr);
+}
+
+char *bionic___loader_dlerror(void)
+{
+	return (char *)bionic_dlerror();
+}
+
+int bionic___loader_dladdr(const void *addr, Dl_info *info)
+{
+	return bionic_dladdr(addr, info);
+}
+
+int bionic___loader_dlclose(void *handle)
+{
+	return bionic_dlclose(handle);
+}
+
+int bionic_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *info, size_t size, void *data), void *data);
+
+int bionic___loader_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *info, size_t size, void *data), void *data)
+{
+	return bionic_dl_iterate_phdr(cb, data);
 }
 
 #if defined(__arm__)
