@@ -10,7 +10,15 @@
 int __system_property_get(const char *name, char *value);
 #define PROP_VALUE_MAX 92
 
-// bionic's api-level.h: the inline before API 29 and libc's function since do the same
+// bionic's api-level.h: the inline before API 29 and libc's function since do the same.
+// Not on x86/x86_64: there libc exporting it says "Android 10 TLS layout". Go's cgo runtime
+// (runtime/cgo/gcc_android.c, inittls(): "android_get_device_api_level is introduced in Android Q,
+// so its mere presence is enough") then keeps g in TLS_SLOT_APP, (tp + 2), which on glibc is
+// tcbhead_t.self (see main_executable/bionic_compat.c), and the first cgo callback on a thread Go
+// did not create reads glibc's self pointer as its g (Feeder: SIGSEGV in runtime.cgocallback).
+// Without it Go looks for a pthread key slot instead (libpthread.c, low keys). On x86 the host program
+// exports it for libraries that link against it (ATL: src/main-executable/bionic_compat.c), outside libc's scope.
+#if !defined(__i386__) && !defined(__x86_64__)
 int android_get_device_api_level(void)
 {
 	char value[PROP_VALUE_MAX] = { 0 };
@@ -19,6 +27,7 @@ int android_get_device_api_level(void)
 	int api_level = atoi(value);
 	return (api_level > 0) ? api_level : -1;
 }
+#endif
 
 // actually misc stuff
 
