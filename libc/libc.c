@@ -60,20 +60,6 @@ struct bionic_sigaction {
 
 // Stuff that doesn't exist in glibc
 
-#define PROP_NAME_MAX  32
-#define PROP_VALUE_MAX 92
-
-int __system_property_get(const char *name, char *value)
-{
-	verbose("%s", name);
-
-	if (!strcmp(name, "ro.build.version.sdk"))
-		return snprintf(value, PROP_VALUE_MAX, "%d", 21);
-
-	*value = 0;
-	return 0;
-}
-
 pid_t gettid(void)
 {
 	return syscall(SYS_gettid);
