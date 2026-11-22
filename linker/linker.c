@@ -2901,16 +2901,17 @@ static int apkenv_link_image(soinfo *si, /*unused...?*/ unsigned wr_offset)
 	mprotect((void*) si->base, wr_offset, PROT_READ | PROT_EXEC);
 }
 #else
-	/* TODO: Verify that this does the right thing in all cases, as it
-	 * presently probably does not. It is possible that an ELF image will
-	 * come with multiple read-only segments. What we ought to do is scan
-	 * the program headers again and mprotect all the read-only segments.
-	 * To prevent re-scanning the program header, we would have to build a
-	 * list of loadable segments in si, and then scan that instead. */
-	if (si->wrprotect_start != 0xffffffff && si->wrprotect_end != 0) {
-		mprotect((void *)(intptr_t)si->wrprotect_start,
-			 si->wrprotect_end - si->wrprotect_start,
-			 PROT_READ | PROT_EXEC);
+	/* like bionic's phdr_table_protect_segments(): each read-only loadable segment gets its own protection back
+	 * (apkenv_load_segments() made them writable for the relocations). The wrprotect_ range is kept in uint32_t
+	 * (soinfo layout) and never held a 64-bit address, so the code of every library stayed writable
+	 * (rwxp in /proc/self/maps). */
+	for (size_t i = 0; i < si->phnum; i++) {
+		ElfW(Phdr) *phdr = &si->phdr[i];
+		if (phdr->p_type != PT_LOAD || (phdr->p_flags & PF_W))
+			continue;
+		ElfW(Addr) seg_start = (si->base + phdr->p_vaddr) & (~PAGE_MASK);
+		ElfW(Addr) seg_end = (si->base + phdr->p_vaddr + phdr->p_memsz + PAGE_SIZE - 1) & (~PAGE_MASK);
+		mprotect((void *)seg_start, seg_end - seg_start, PFLAGS_TO_PROT(phdr->p_flags));
 	}
 #endif
 
