@@ -282,6 +282,8 @@ ElfW(Sym) *apkenv_lookup(const char *name, soinfo **found, soinfo *start);
 soinfo *apkenv_find_containing_library(const void *addr);
 ElfW(Sym) *apkenv_find_containing_symbol(const void *addr, soinfo *si);
 const char *apkenv_linker_get_error(void);
+/* dlsym(RTLD_DEFAULT, name), kept per name while the host libraries stay the same */
+void *apkenv_global_dlsym(const char *name);
 void apkenv_call_constructors_recursive(soinfo *si);
 
 #if defined(__arm__)

@@ -46,6 +46,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fnmatch.h>
+#include <link.h>
+#include <stddef.h>
 
 #include <pthread.h>
 
@@ -1818,6 +1820,105 @@ static inline ElfW(Addr) get_addend(REL_TYPE *rel) {
 #endif
 }
 
+/* dlsym(RTLD_DEFAULT) walks glibc's global scope, every host library, and for a name none of them has (most
+ * bionic_ names) it looks into each one: ~2.3 us per lookup, 1 800 lookups for VLC's libvlc.so alone. Libraries
+ * ask for the same names (malloc, memcpy, bionic_malloc...), so the answer is kept per name, for as long as the
+ * set of host libraries is the same: glibc counts loads and unloads (dlpi_adds, dlpi_subs), any change drops
+ * every kept answer. Not seen by the counters: a library loaded RTLD_LOCAL and later made global again with
+ * RTLD_NOLOAD | RTLD_GLOBAL; with ANDROID_LOG_TAGS set (debug) each kept answer is checked against a live
+ * lookup and a difference is logged. */
+#define GLOBAL_SYM_BUCKETS 8192
+struct global_sym {
+	struct global_sym *next;
+	void *addr;
+	char name[];
+};
+static struct global_sym **global_syms;
+static unsigned long long global_syms_adds, global_syms_subs;
+static pthread_mutex_t global_syms_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct load_counts {
+	unsigned long long adds, subs;
+	bool known;
+};
+
+static int load_counts_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+	struct load_counts *c = data;
+	c->known = size >= offsetof(struct dl_phdr_info, dlpi_subs) + sizeof(info->dlpi_subs);
+	if (c->known) {
+		c->adds = info->dlpi_adds;
+		c->subs = info->dlpi_subs;
+	}
+	return 1;
+}
+
+static void global_syms_drop(void)
+{
+	for (size_t i = 0; i < GLOBAL_SYM_BUCKETS; i++) {
+		struct global_sym *e = global_syms[i];
+		while (e) {
+			struct global_sym *next = e->next;
+			free(e);
+			e = next;
+		}
+		global_syms[i] = NULL;
+	}
+}
+
+void *apkenv_global_dlsym(const char *name)
+{
+	struct load_counts c = {0};
+	dl_iterate_phdr(load_counts_cb, &c);
+	if (!c.known)
+		return dlsym(RTLD_DEFAULT, name);
+	uint32_t h = 5381;
+	for (const char *p = name; *p; p++)
+		h = h * 33 + (unsigned char)*p;
+	h %= GLOBAL_SYM_BUCKETS;
+
+	pthread_mutex_lock(&global_syms_lock);
+	if (!global_syms)
+		global_syms = calloc(GLOBAL_SYM_BUCKETS, sizeof(*global_syms));
+	if (global_syms && (c.adds != global_syms_adds || c.subs != global_syms_subs)) {
+		global_syms_drop();
+		global_syms_adds = c.adds;
+		global_syms_subs = c.subs;
+	}
+	struct global_sym *e = global_syms ? global_syms[h] : NULL;
+	while (e && strcmp(e->name, name))
+		e = e->next;
+	pthread_mutex_unlock(&global_syms_lock);
+	if (e) {
+		if (android_log_below_info_wanted()) {
+			void *live = dlsym(RTLD_DEFAULT, name);
+			if (live != e->addr) {
+				WARN("kept dlsym(RTLD_DEFAULT, %s) %p differs from the live lookup %p\n", name, e->addr, live);
+				return live;
+			}
+		}
+		return e->addr;
+	}
+
+	void *addr = dlsym(RTLD_DEFAULT, name);
+	size_t len = strlen(name) + 1;
+	e = malloc(sizeof(*e) + len);
+	if (!e)
+		return addr;
+	e->addr = addr;
+	memcpy(e->name, name, len);
+	pthread_mutex_lock(&global_syms_lock);
+	/* the host libraries may have changed meanwhile: keep the answer only for the set it was asked in */
+	if (global_syms && c.adds == global_syms_adds && c.subs == global_syms_subs) {
+		e->next = global_syms[h];
+		global_syms[h] = e;
+		e = NULL;
+	}
+	pthread_mutex_unlock(&global_syms_lock);
+	free(e);
+	return addr;
+}
+
 static bool die_because_of_missing_symbols = false;
 
 static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
@@ -1856,11 +1957,11 @@ static int apkenv_reloc_library(soinfo *si, REL_TYPE *rel, size_t count)
 			if ((s = apkenv__elf_lookup(si, &own_name))) {
 				base = si->base;
 				apkenv_last_library_used = si->name;
-			} else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+			} else if ((sym_addr = (uintptr_t)apkenv_global_dlsym(wrap_sym_name))) {
 				LINKER_DEBUG_PRINTF("%s hooked symbol %s to %p\n", si->name, wrap_sym_name, (void *)sym_addr);
 			} else if ((s = apkenv__do_lookup(si, sym_name, &base))) {
 				// normal symbol
-			} else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, sym_name))) {
+			} else if ((sym_addr = (uintptr_t)apkenv_global_dlsym(sym_name))) {
 				if (strstr(sym_name, "pthread_"))
 					fprintf(stderr, "symbol may need to be wrapped: %s\n", sym_name);
 				LINKER_DEBUG_PRINTF("%s hooked symbol %s to %p\n", si->name, sym_name, (void *)sym_addr);

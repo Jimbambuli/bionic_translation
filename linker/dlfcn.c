@@ -230,7 +230,7 @@ static void *dlsym_for_caller(void *handle, const char *symbol, const void *call
 		is_this_our_handle = do_we_have_this_handle(handle);
 
 	if (!is_this_our_handle) { // if the handle is not our handle, we can probably just try calling glibc dlsym
-		if ((sym = dlsym(RTLD_DEFAULT, wrap_sym_name))) { // TODO: this is not ideal, we should probably translate all android system libary names to ..._android.so.0 and have those either be symlinks or small libs which depend on the actual lib and in addition implement bionic_ overrides
+		if ((sym = apkenv_global_dlsym(wrap_sym_name))) { // TODO: this is not ideal, we should probably translate all android system libary names to ..._android.so.0 and have those either be symlinks or small libs which depend on the actual lib and in addition implement bionic_ overrides
 			pthread_mutex_unlock(&apkenv_dl_lock);
 			verbose("system dlopen handle: found bionic_ version");
 			return wrapper_create(symbol, sym);
@@ -245,7 +245,7 @@ static void *dlsym_for_caller(void *handle, const char *symbol, const void *call
 	}
 
 	/* allow overriding stuff even when the app specifies a particular .so; TODO: we should probably not do this */
-	if ((sym = dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+	if ((sym = apkenv_global_dlsym(wrap_sym_name))) {
 		pthread_mutex_unlock(&apkenv_dl_lock);
 		verbose("RTLD_DEFAULT: found bionic_ version");
 		return wrapper_create(symbol, sym);
@@ -274,7 +274,7 @@ static void *dlsym_for_caller(void *handle, const char *symbol, const void *call
 	 * last. Firefox's mozglue finds the real putenv() with dlsym(RTLD_NEXT), Dart's FFI finds
 	 * calloc() with dlsym(RTLD_DEFAULT). */
 	if (!sym && (handle == RTLD_DEFAULT || handle == RTLD_NEXT)) {
-		void *host_sym = dlsym(RTLD_DEFAULT, symbol);
+		void *host_sym = apkenv_global_dlsym(symbol);
 		if (host_sym) {
 			pthread_mutex_unlock(&apkenv_dl_lock);
 			verbose("RTLD_DEFAULT / RTLD_NEXT: found system version");
