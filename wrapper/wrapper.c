@@ -34,10 +34,11 @@ static int fallback_verbose_log(int prio, const char *tag, const char *fmt, va_l
 	return ret;
 }
 
-/* liblog (fake_log_device) drops verbose and debug lines unless ANDROID_LOG_TAGS asks for them (the global
- * minimum is info), but formats each one first: the linker's lines, one or more per relocation (~200 000 for
- * VLC's libvlc.so), cost ~9 ms there. Without ANDROID_LOG_TAGS (read once) they are dropped before formatting;
- * with it (apk-starter's debug sets it) liblog filters as before. */
+/* liblog (art's fake_log_device) drops verbose and debug lines unless ANDROID_LOG_TAGS asks for them (the global
+ * minimum is info); __android_log_vprint asks __android_log_is_loggable first (two lock round trips and a walk of
+ * the tag list) for each of the linker's lines, one or more per relocation (~200 000 for VLC's libvlc.so).
+ * Without ANDROID_LOG_TAGS (read once) they are dropped here; with it (apk-starter's debug sets it) liblog
+ * filters as before. */
 bool android_log_below_info_wanted(void)
 {
 	static int wanted = -1;
